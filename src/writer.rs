@@ -5,7 +5,7 @@ use std::thread::JoinHandle;
 use crate::buf::DoubleBuf;
 use std::io::Write;
 use std::sync::{Arc, Mutex, atomic::AtomicBool, atomic::Ordering};
-use super::{Writer, Error};
+use super::{Writer, Error, ErrorRepr, ErrorKind};
 
 
 /// Writer to a file.
@@ -22,7 +22,7 @@ impl FileWriter {
 
         let epoch_secs = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|e| -> Error { Error::TimeError(e) })?
+            .map_err(|e| { Error::new(ErrorKind::TimeError, ErrorRepr::TimeError(e)) })?
             .as_secs();
 
         let file_name = format!("log_{}.txt", epoch_secs);
@@ -34,13 +34,13 @@ impl FileWriter {
 
         let file_path = file_path
             .to_str()
-            .ok_or(Error::PathToStrConversionError)?;
+            .ok_or(Error::new(ErrorKind::PathToStrConversionError, ErrorRepr::Simple))?;
 
         let f = std::fs::OpenOptions::new()
             .append(true)
             .create_new(true)
             .open(file_path)
-            .map_err(|e| -> Error { Error::IoError(e) })?;
+            .map_err(|e| { Error::new(ErrorKind::IoError, ErrorRepr::IoError(e)) })?;
 
         Ok(FileWriter {
             f,

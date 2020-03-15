@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering, compiler_fence};
 use std::sync::{Mutex, Condvar, Arc};
 use std::ops::{Deref, DerefMut};
 use std::cell::RefCell;
-use super::Error;
+use super::{Error, ErrorRepr, ErrorKind};
 
 
 // for optimization: storing last writable buf id optimistically expecting it will be writable the next
@@ -36,7 +36,7 @@ impl Buf {
 
         if size > (std::isize::MAX as usize) || size < 1 {
 
-            return Err(Error::IncorrectBufferSize);
+            return Err(Error::new(ErrorKind::IncorrectBufferSize, ErrorRepr::Simple));
         }
 
         let ptr: *mut u8;
@@ -46,13 +46,13 @@ impl Buf {
             let align = std::mem::align_of::<u8>();
             ptr = std::alloc::alloc(
                 std::alloc::Layout::from_size_align(size, align)
-                .map_err(|e| { Error::MemoryLayoutError(e) })?
+                .map_err(|e| { Error::new(ErrorKind::MemoryLayoutError, ErrorRepr::MemoryLayoutError(e)) })?
             );
         }
 
         if ptr.is_null() {
 
-            Err(Error::AllocFailure)
+            Err(Error::new(ErrorKind::AllocFailure, ErrorRepr::Simple))
 
         } else {
 

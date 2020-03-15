@@ -196,13 +196,9 @@ impl AsyncLoggerNB {
 
 /// Errors returned by the crate functions.
 #[derive(Debug)]
-pub enum Error {
-    PathToStrConversionError,
-    TimeError(std::time::SystemTimeError),
-    IoError(std::io::Error),
-    IncorrectBufferSize,
-    AllocFailure,
-    MemoryLayoutError(std::alloc::LayoutErr),
+pub struct Error {
+    kind: ErrorKind,
+    repr: ErrorRepr
 }
 
 impl std::fmt::Display for Error {
@@ -211,8 +207,65 @@ impl std::fmt::Display for Error {
     }
 }
 
+impl Error {
+
+    fn new(kind: ErrorKind, repr: ErrorRepr) -> Error {
+        Error {
+            kind,
+            repr
+        }
+    }
+
+    /// For kind IoError return associated io error.
+    pub fn io_err(self) -> Option<std::io::Error> {
+        match self.repr {
+            ErrorRepr::IoError(e) => Some(e),
+            _ => None
+        }
+    }
+
+    /// For kind IoError return associated io error.
+    pub fn time_err(self) -> Option<std::time::SystemTimeError> {
+        match self.repr {
+            ErrorRepr::TimeError(e) => Some(e),
+            _ => None
+        }
+    }
+
+    /// For kind IoError return associated io error.
+    pub fn layout_err(self) -> Option<std::alloc::LayoutErr> {
+        match self.repr {
+            ErrorRepr::MemoryLayoutError(e) => Some(e),
+            _ => None
+        }
+    }
+
+    pub fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+}
+
 impl std::error::Error for Error { }
 
+
+/// Error kinds.
+#[derive(Debug, PartialEq, Copy, Clone)]
+pub enum ErrorKind {
+    PathToStrConversionError,
+    TimeError,
+    IoError,
+    IncorrectBufferSize,
+    AllocFailure,
+    MemoryLayoutError,
+}
+
+#[derive(Debug)]
+enum ErrorRepr {
+    Simple,
+    IoError(std::io::Error),
+    TimeError(std::time::SystemTimeError),
+    MemoryLayoutError(std::alloc::LayoutErr),
+}
 
 
 #[cfg(test)]
