@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering, compiler_fence};
 use std::sync::{Mutex, Condvar, Arc};
 use std::ops::{Deref, DerefMut};
 use std::cell::RefCell;
+use super::Error;
 
 
 // for optimization: storing last writable buf id optimistically expecting it will be writable the next
@@ -31,11 +32,11 @@ impl Buf {
     /// `size` must be > 0 and <= std::isize::MAX.
     /// # Errors
     /// Returns `Err` if allocation has failed.
-    fn new(size: usize) -> Result<Buf, ()> {
+    fn new(size: usize) -> Result<Buf, Error> {
 
         if size > (std::isize::MAX as usize) || size < 1 {
 
-            return Err(());
+            return Err(Error::IncorrectBufferSize);
         }
 
         let ptr: *mut u8;
@@ -43,12 +44,15 @@ impl Buf {
         unsafe {
 
             let align = std::mem::align_of::<u8>();
-            ptr = std::alloc::alloc(std::alloc::Layout::from_size_align(size, align).unwrap());
+            ptr = std::alloc::alloc(
+                std::alloc::Layout::from_size_align(size, align)
+                .map_err(|e| { Error::MemoryLayoutError(e) })?
+            );
         }
 
         if ptr.is_null() {
 
-            Err(())
+            Err(Error::AllocFailure)
 
         } else {
 
@@ -216,7 +220,7 @@ impl DoubleBuf {
 
 
     /// Create an instance of buffer pair, each of size `sz`.
-    pub fn new(sz: usize) -> Result<DoubleBuf, ()> {
+    pub fn new(sz: usize) -> Result<DoubleBuf, Error> {
 
         let bufs = Arc::new(vec![Buf::new(sz)?, Buf::new(sz)?]);
 

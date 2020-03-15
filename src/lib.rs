@@ -14,37 +14,41 @@
 //! `FileWriter` that writes data to a file. You can create your own implementation of the `Writer`
 //! trait as well.
 //!
+//! Implementation of [log](https://docs.rs/log) facade based on this asyncronous logger is available as separate crate
+//! [async_logger_log](https://docs.rs/async_logger_log). Please refer to `async_logger_log` crate documentation for more info and examples.
+//!
 //! # Examples
+//! ```
+//! use async_logger::FileWriter;
+//! use async_logger::AsyncLoggerNB;
+//! use std::{thread, sync::Arc};
 //!
-//!     use async_logger::FileWriter;
-//!     use async_logger::AsyncLoggerNB;
-//!     use std::{thread, sync::Arc};
+//! let writer = FileWriter::new("/tmp").expect("Failed to create file writer");
 //!
-//!     let writer = FileWriter::new("/tmp").expect("Failed to create file writer");
+//! let logger = Arc::new(AsyncLoggerNB::new(Box::new(writer), 1024)
+//!     .expect("Failed to create new async logger"));
 //!
-//!     let logger = Arc::new(AsyncLoggerNB::new(Box::new(writer), 1024).expect("Failed to create new async logger"));
+//! let write_line = "Hello, world!\n";
+//! 
+//! let logger_c = logger.clone();
 //!
-//!     let write_line = "Hello, world!\n";
-//!     
-//!     let logger_c = logger.clone();
+//! let handle = thread::spawn(move || {
 //!
-//!     let handle = thread::spawn(move || {
+//!     logger_c.write_slice(write_line.as_bytes()).unwrap();
+//!     logger_c.write_slice(write_line.as_bytes()).unwrap();
+//!     logger_c.flush();
 //!
-//!         logger_c.write_slice(write_line.as_bytes()).unwrap();
-//!         logger_c.write_slice(write_line.as_bytes()).unwrap();
-//!         logger_c.flush();
+//!     logger_c.write_slice(write_line.as_bytes()).unwrap();
 //!
-//!         logger_c.write_slice(write_line.as_bytes()).unwrap();
+//! });
 //!
-//!     });
+//! handle.join().expect("Failed on thread join");
 //!
-//!     handle.join().expect("Failed on thread join");
-//!
-//!     match Arc::try_unwrap(logger) {
-//!         Ok(logger) => logger.terminate(),
-//!         Err(_) => panic!("Failed to terminate logger because it is still in use"),
-//!     };
-//!
+//! match Arc::try_unwrap(logger) {
+//!     Ok(logger) => logger.terminate(),
+//!     Err(_) => panic!("Failed to terminate logger because it is still in use"),
+//! };
+//! ```
 //!
 
 
@@ -96,7 +100,7 @@ impl AsyncLoggerNB {
     /// # Panics
     ///
     /// Panics of OS fails to create thread.
-    pub fn new(writer: Box<dyn Writer>, buf_sz: usize) -> Result<AsyncLoggerNB, ()> {
+    pub fn new(writer: Box<dyn Writer>, buf_sz: usize) -> Result<AsyncLoggerNB, Error> {
 
         let buf = DoubleBuf::new(buf_sz)?;
 
@@ -189,6 +193,26 @@ impl AsyncLoggerNB {
         self.buf.flush();
     }
 }
+
+/// Errors returned by the crate functions.
+#[derive(Debug)]
+pub enum Error {
+    PathToStrConversionError,
+    TimeError(std::time::SystemTimeError),
+    IoError(std::io::Error),
+    IncorrectBufferSize,
+    AllocFailure,
+    MemoryLayoutError(std::alloc::LayoutErr),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_string())
+    }
+}
+
+impl std::error::Error for Error { }
+
 
 
 #[cfg(test)]

@@ -5,24 +5,7 @@ use std::thread::JoinHandle;
 use crate::buf::DoubleBuf;
 use std::io::Write;
 use std::sync::{Arc, Mutex, atomic::AtomicBool, atomic::Ordering};
-use super::Writer;
-
-
-/// Error returned by `FileWriter::new`.
-#[derive(Debug)]
-pub enum Error {
-    PathError,
-    TimeError(std::time::SystemTimeError),
-    IoError(std::io::Error),
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_string())
-    }
-}
-
-impl std::error::Error for Error { }
+use super::{Writer, Error};
 
 
 /// Writer to a file.
@@ -51,7 +34,7 @@ impl FileWriter {
 
         let file_path = file_path
             .to_str()
-            .ok_or(Error::PathError)?;
+            .ok_or(Error::PathToStrConversionError)?;
 
         let f = std::fs::OpenOptions::new()
             .append(true)
