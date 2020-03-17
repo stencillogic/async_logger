@@ -82,9 +82,9 @@ pub trait Writer: Send {
 pub struct AsyncLoggerNB {
     buf:    DoubleBuf,
     tw:     ThreadedWriter,
-    size:   usize,
     writer: Arc<Mutex<Box<dyn Writer>>>,
     terminated: Arc<Mutex<bool>>,
+    threshold:  usize,
 }
 
 
@@ -112,12 +112,14 @@ impl AsyncLoggerNB {
 
         let terminated = Arc::new(Mutex::new(false));
 
+        let threshold = buf_sz - buf_sz / 5;
+
         Ok(AsyncLoggerNB {
             buf,
             tw,
-            size: buf_sz,
             writer,
             terminated,
+            threshold,
         })
     }
 
@@ -143,10 +145,11 @@ impl AsyncLoggerNB {
         }
     }
 
-    /// Write a slice of `u8`. If the size of slice is larger than buffer size then buffer is
+    /// Write a slice of `u8`. If the size of slice is larger or equal to 0.8 * buffer_size then buffer is
     /// bypassed, and slice is handed directly to writer. Note, in this case message can appear
     /// out-of-order.
-    /// Function blocks if there is not enough free space in buffer available.
+    /// Function blocks if message size is less than 0.8 * buffer_size, and there is not enough free space in any of buffers. 
+    /// As soon as there is free space larger than 0.8 * buffer_size available slice is written and function returns.
     ///
     /// # Errors
     ///
@@ -158,7 +161,7 @@ impl AsyncLoggerNB {
     /// This function panics if some of the internal mutexes is poisoned or when writer panics.
     pub fn write_slice(&self, slice: &[u8]) -> Result<(),()> {
 
-        if slice.len() > self.size {
+        if slice.len() >= self.threshold {
 
             let mut guard = self.writer.lock().unwrap();
 
@@ -183,7 +186,7 @@ impl AsyncLoggerNB {
 
     /// Mark not yet full buffer as ready for writer.
     /// This function doesn't call `Writer::flush.
-    /// THis function doesn't wait while writer process all the previously written data.
+    /// This function doesn't wait while writer process all the previously written data.
     ///
     /// # Panics
     ///
