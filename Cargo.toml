@@ -8,6 +8,7 @@ description = "Asyncronous logger allows writing arbitrary u8 slices to a memory
 categories = ["asynchronous", "concurrency"]
 keywords = ["async", "logging", "logger"]
 repository = "https://github.com/stencillogic/async_logger"
+readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
