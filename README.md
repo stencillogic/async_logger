@@ -58,6 +58,6 @@ match Arc::try_unwrap(logger) {
 };
 ```
 
-# Notes
+## Notes
 
 1. This crate was tested on Linux x86_64. Rust version 1.42.
