@@ -1,8 +1,7 @@
 //! Buffer management
 
-use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering, compiler_fence};
+use std::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 use std::sync::{Mutex, Condvar, Arc};
-use std::ops::{Deref, DerefMut};
 use std::cell::RefCell;
 use super::{Error, ErrorRepr, ErrorKind};
 
@@ -22,7 +21,7 @@ pub struct Buf {
     size:           usize,
     used_size:      AtomicUsize,
     acquire_size:   AtomicUsize,
-    use_counter:    AtomicU64,
+    done_size:      AtomicUsize,
 }
 
 impl Buf {
@@ -61,7 +60,7 @@ impl Buf {
                 size,
                 used_size: AtomicUsize::new(0),
                 acquire_size: AtomicUsize::new(0),
-                use_counter: AtomicU64::new(0),
+                done_size: AtomicUsize::new(0),
             })
         }
     }
@@ -71,47 +70,58 @@ impl Buf {
     fn reset(&self) {
 
         self.used_size.store(0, Ordering::Relaxed);
+        self.done_size.store(0, Ordering::Relaxed);
 
-        compiler_fence(Ordering::Release);
+        compiler_fence(Ordering::SeqCst);
 
         self.acquire_size.store(0, Ordering::Relaxed);
     }
 
 
-    /// Returns buffer area of size `reserve_size` for writing.
-    /// Returns tuple of `Option` and `bool`. 
-    /// `None` if there is not enough space for requested `reserve_size`.
-    /// `true` is returned if `release_after_reserve` is required.
-    fn reserve_bytes(&self, reserve_size: usize) -> (Option<&mut [u8]>, bool) {
+    /// increment value of atomic, and return old value
+    fn inc_atomic_var(atomic: &AtomicUsize, val: usize) -> usize {
+        let mut prev_val = 0;
+        loop {
+            let cur_val = atomic.compare_and_swap(
+                prev_val,
+                prev_val + val,
+                Ordering::Relaxed,
+            );
 
-        let mut prev_acq_size = self.acquire_size.load(Ordering::Relaxed);
+            if cur_val == prev_val {
+                return cur_val;
+            }
 
-        // avoid excessive writer notifications
-        if prev_acq_size > self.size {
-
-            return (None, false);
+            prev_val = cur_val;
         }
+    }
 
-        compiler_fence(Ordering::SeqCst);
 
-        // argument sanity check is optimistically after the buffer space avilability check 
-        if reserve_size > self.size + 1 || reserve_size > std::usize::MAX - self.size {
+    /// Returns tuple of `bool` and `bool`: "data is written", and "notify writer"
+    fn write_slice(&self, slice: &[u8]) -> (bool, bool) {
 
-            return (None, false);
-        }
+        let reserve_size = slice.len();
 
         if reserve_size == 0 {
 
-            return (Some(&mut []), false);
+            return (true, false);
         }
 
-        compiler_fence(Ordering::SeqCst);
+        if reserve_size > self.size || reserve_size > std::usize::MAX - self.size {
 
-        self.use_counter.fetch_add(1, Ordering::Relaxed);
+            return (false, false);
+        }
 
-        compiler_fence(Ordering::SeqCst);
+        let mut prev_acq_size = self.acquire_size.load(Ordering::Relaxed);
 
         loop {
+
+            if prev_acq_size > self.size {
+
+                return (false, false);
+            }
+
+            compiler_fence(Ordering::SeqCst);
 
             let cur_acq_size = self.acquire_size.compare_and_swap(
                 prev_acq_size,
@@ -123,56 +133,80 @@ impl Buf {
 
                 if cur_acq_size + reserve_size > self.size {
 
-                    return (None, true);
+                    if self.size > cur_acq_size {
+                        let done_size = self.size - cur_acq_size;
+                        let total_done = Self::inc_atomic_var(&self.done_size, done_size) + done_size;
+                        return (false, total_done == self.size);
+                    }
+
+                    return (false, false);
 
                 } else {
 
-                    self.used_size.fetch_add(reserve_size, Ordering::Relaxed);
-
-                    let slice;
+                    Self::inc_atomic_var(&self.used_size, reserve_size);
 
                     unsafe {
 
-                        slice = std::slice::from_raw_parts_mut(
-                            self.ptr.offset(cur_acq_size as isize),
-                            reserve_size);
+                        std::ptr::copy(slice.as_ptr(), 
+                                       self.ptr.offset(cur_acq_size as isize), 
+                                       reserve_size);
                     }
 
-                    return (Some(slice), true);
+                    let total_done = Self::inc_atomic_var(&self.done_size, reserve_size) + reserve_size;
+                    return (true, total_done == self.size);
                 }
 
             } else {
 
                 prev_acq_size = cur_acq_size;
             }
-            
+        }
+    }
+
+    
+    /// try to take up all remaining space, return true if to notify writer
+    fn reserve_rest(&self) -> bool {
+        
+        let reserve_size = self.size + 1;
+
+        let mut prev_acq_size = self.acquire_size.load(Ordering::Relaxed);
+
+        loop {
+
             if prev_acq_size > self.size {
 
-                return (None, true);
+                return false;
             }
 
+            compiler_fence(Ordering::SeqCst);
+
+            let cur_acq_size = self.acquire_size.compare_and_swap(
+                prev_acq_size,
+                prev_acq_size + reserve_size,
+                Ordering::Relaxed,
+            );
+
+            if cur_acq_size == prev_acq_size {
+
+                if self.size > cur_acq_size {
+
+                    let done_size = self.size - cur_acq_size;
+                    let total_done = Self::inc_atomic_var(&self.done_size, done_size) + done_size;
+
+                    return total_done == self.size;
+                }
+
+                return false;
+
+            } else {
+
+                prev_acq_size = cur_acq_size;
+            }
         }
     }
-
-
-    /// Release bytes previously reserved with `reserve_bytes`.
-    /// Return `true` if writer notification is required, `false` otherwise.
-    fn release_after_reserve(&self) -> bool {
-
-        self.use_counter.fetch_sub(1, Ordering::Relaxed) == 1
-
-            && self.acquire_size.load(Ordering::Relaxed) > self.size
-    }
-
 
     /// Returns buffer for reading.
-    fn acquire_for_read(&self) -> Option<&[u8]> {
-
-        // it can happen the buffer is not full 
-        if self.acquire_size.load(Ordering::Relaxed) <= self.size {
-
-            return None;
-        }
+    fn acquire_for_read(&self) -> &[u8] {
 
         let total_written = self.used_size.load(Ordering::Relaxed);
 
@@ -183,7 +217,7 @@ impl Buf {
             ret = std::slice::from_raw_parts(self.ptr, total_written);
         };
 
-        Some(ret)
+        ret
     }
 }
 
@@ -241,11 +275,28 @@ impl DoubleBuf {
         self.bufs.len()
     }
 
+    fn try_write(&self, buf_id: usize, slice: &[u8]) -> bool {
 
-    /// Return a slice of `u8` of `reserve_size` length for writing.
-    /// If there is no free space the method blocks until there is a free buffer space available.
-    /// Err is returned when buffer is terminated.
-    pub fn reserve_for_write(&self, reserve_size: usize) -> Result<Bytes, ()> {
+        let (is_written, notify_writer) = self.bufs[buf_id].write_slice(slice);
+
+        if notify_writer {
+
+            self.set_buf_readable(buf_id);
+        }
+
+        if is_written {
+
+            CUR_BUF.with( |v| {
+                *v.borrow_mut() = buf_id; 
+            });
+        }
+
+        return is_written;
+    }
+
+    /// Write data.
+    /// `Err` is retured if buffer is terminated
+    pub fn write_slice(&self, slice: &[u8]) -> Result<(), ()> {
 
         let mut cur_buf = 0;
 
@@ -253,55 +304,28 @@ impl DoubleBuf {
             cur_buf = *v.borrow(); 
         });
 
-        fn try_get(slf: &DoubleBuf, buf_id: usize, reserve_size: usize) -> Option<Bytes> {
-
-            match slf.bufs[buf_id].reserve_bytes(reserve_size) {
-
-                (Some(slice), release) => {
-
-                    CUR_BUF.with( |v| {
-                        *v.borrow_mut() = buf_id; 
-                    });
-
-                    return Some(Bytes {
-                        slice,
-                        parent: slf,
-                        buf_id: buf_id,
-                        release,
-                    })
-                },
-
-                (None, release) => {
-
-                    if release {
-
-                        if slf.bufs[buf_id].release_after_reserve() {
-
-                            slf.set_buf_readable(buf_id);
-                        }
-                    }
-
-                    None
-                }
-            }
-        }
-
-        let mut appendable = false;
+        let mut appendable = 0;
 
         loop {
 
-            if let Some(bytes) = try_get(self, cur_buf, reserve_size) {
+            if self.try_write(cur_buf, slice) {
 
-                return Ok(bytes);
+                return Ok(());
 
-            } else if let Some(bytes) = try_get(self, 1 - cur_buf, reserve_size) {
+            } else if self.try_write(1 - cur_buf, slice) {
 
-                return Ok(bytes);
+                return Ok(());
 
             } else {
 
-                if appendable {
+                if appendable > 0 {
+
                     std::thread::yield_now();
+
+                    if appendable > 10000 {
+                        std::thread::sleep(std::time::Duration::new(0,10_000_000));
+                        appendable = 0;
+                    }
                 }
 
                 let (buf_id, state) = self.wait_for(BufState::Appendable as u32 | BufState::Terminated as u32);
@@ -313,7 +337,7 @@ impl DoubleBuf {
 
                 cur_buf = buf_id;
 
-                appendable = true;
+                appendable += 1;
             }
         }
     }
@@ -323,17 +347,9 @@ impl DoubleBuf {
     /// If the buffer is not full the method blocks until buffer is ready for processing.
     pub fn reserve_for_reaed(&self, buf_id: usize) -> &[u8] {
 
-        loop {
+        self.wait_for_buf(BufState::Readable as u32, buf_id);
 
-            self.wait_for_buf(BufState::Readable as u32, buf_id);
-
-            // must be just single writer thread to avoid race !
-            
-            if let Some(slice) = self.bufs[buf_id].acquire_for_read() {
-
-                return slice;
-            }
-        }
+        return self.bufs[buf_id].acquire_for_read();
     }
 
 
@@ -351,7 +367,7 @@ impl DoubleBuf {
 
             for i in 0..cur_state.len() {
 
-                if 0 != cur_state[i] as u32 & state {
+                if 0 != (cur_state[i] as u32 & state) {
 
                     return (i, cur_state[i]);
                 }
@@ -373,7 +389,7 @@ impl DoubleBuf {
 
         loop {
 
-            if 0 != cur_state[buf_id] as u32 & state {
+            if 0 != (cur_state[buf_id] as u32 & state) {
 
                 return cur_state[buf_id];
             }
@@ -382,27 +398,43 @@ impl DoubleBuf {
         }
     }
 
-
-    #[inline]
     fn set_buf_readable(&self, buf_id: usize) {
 
-        self.set_buf(buf_id, BufState::Readable)
+        let (ref lock, ref _cvar_a, ref cvar_r) = *self.buf_state;
+
+        let mut cur_state = lock.lock().unwrap();
+
+        cur_state[buf_id] = BufState::Readable;
+
+        cvar_r.notify_all();
     }
 
 
-    #[inline]
     pub fn set_buf_terminated(&self, buf_id: usize) {
 
-        self.set_buf(buf_id, BufState::Terminated)
+        let (ref lock, ref cvar_a, ref _cvar_r) = *self.buf_state;
+
+        let mut cur_state = lock.lock().unwrap();
+
+        cur_state[buf_id] = BufState::Terminated;
+
+        cvar_a.notify_all();
     }
 
 
-    #[inline]
     pub fn set_buf_appendable(&self, buf_id: usize) {
 
-        self.set_buf(buf_id, BufState::Appendable);
+        let (ref lock, ref cvar_a, ref _cvar_r) = *self.buf_state;
 
+        let mut cur_state = lock.lock().unwrap();
+
+        compiler_fence(Ordering::SeqCst);
         self.bufs[buf_id].reset();
+        compiler_fence(Ordering::SeqCst);
+
+        cur_state[buf_id] = BufState::Appendable;
+
+        cvar_a.notify_all();
     }
 
 
@@ -412,23 +444,6 @@ impl DoubleBuf {
         if 0 != state & (BufState::Readable as u32) { cvar_r } else { cvar_a }
     }
 
-
-    /// Set state of buffer `buf_id` to value of `state`.
-    fn set_buf(&self, buf_id: usize, state: BufState) {
-
-        let (ref lock, ref cvar_a, ref cvar_r) = *self.buf_state;
-
-        let mut cur_state = lock.lock().unwrap();
-
-        let cvar = DoubleBuf::determine_cvar(state as u32, cvar_a, cvar_r);
-
-        if cur_state[buf_id] != state {
-
-            cur_state[buf_id] = state;
-            
-            cvar.notify_all();
-        }
-    }
 
     /// Flush the last used in current thread buffer
     pub fn flush(&self) {
@@ -448,25 +463,9 @@ impl DoubleBuf {
 
     fn flush_buf(&self, buf_id: usize) {
 
-        match self.bufs[buf_id].reserve_bytes(self.size + 1) {
+        if self.bufs[buf_id].reserve_rest() {
 
-            (Some(_), _) => {
-
-                // we can't get slice larger than buffer size
-                panic!("Unexpected state detected!");
-            },
-
-            (None, release) => {
-
-                if release {
-
-                    if self.bufs[buf_id].release_after_reserve() {
-
-                        // notify that buffer is ready to be processed by writer
-                        self.set_buf_readable(buf_id);
-                    }
-                }
-            },
+            self.set_buf_readable(buf_id);
         }
     }
 
@@ -515,48 +514,6 @@ enum BufState {
     Appendable = 0b001,
     Readable = 0b010,
     Terminated = 0b100,
-}
-
-
-
-/// Wrapper for writable slice of [u8]
-pub struct Bytes<'a> {
-    slice:  &'a mut [u8],
-    parent: &'a DoubleBuf,
-    buf_id: usize,
-    release: bool,
-}
-
-
-impl<'a> Deref for Bytes<'a> {
-
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        self.slice
-    }
-}
-
-impl<'a> DerefMut for Bytes<'a> {
-
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.slice
-    }
-}
-
-impl<'a> Drop for Bytes<'a> {
-
-    fn drop(&mut self) {
-
-        if self.release {
-
-            if self.parent.bufs[self.buf_id].release_after_reserve() {
-
-                // notify that buffer is ready for the writer
-                self.parent.set_buf_readable(self.buf_id);
-            }
-        }
-    }
 }
 
 

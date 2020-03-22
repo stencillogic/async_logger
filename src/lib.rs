@@ -169,16 +169,7 @@ impl AsyncLoggerNB {
 
         } else {
 
-            if let Ok(mut dst) = self.buf.reserve_for_write(slice.len()) {
-
-                unsafe {
-                    std::ptr::copy(slice.as_ptr(), dst.as_mut_ptr(), dst.len());
-                }
-
-            } else {
-
-                return Err(());
-            }
+            self.buf.write_slice(slice)?;
         }
 
         Ok(())
@@ -343,7 +334,7 @@ mod tests {
 
             let handle = thread::spawn(move || {
 
-                for i in 0..cnt {
+                for i in 1..cnt+1 {
                     logger_c.write_slice(s.as_bytes()).unwrap();
 
                     if i % flush_cnt == 0 {
@@ -588,5 +579,69 @@ mod tests {
 
         let slice_cnt = slice_cnt.load(Ordering::Relaxed);
         assert!(2 <= slice_cnt && 4 >= slice_cnt, "Slice count has unexpected value {}", slice_cnt);
+    }
+
+    struct StubWriter {
+        counters: [u64; 4],
+        lengths: [usize; 4],
+    }
+
+    impl Writer for StubWriter {
+        fn process_slice(&mut self, slice: &[u8]) {
+            let mut p = 0;
+            while p<slice.len() {
+                let l = (slice[p] - 49) as usize;
+                if l > 3 {
+                    println!("l = {}, p = {}, slice = {}", l, p, String::from_utf8_lossy(slice));
+                }
+                self.counters[l] += 1;
+                p += self.lengths[l];
+            }
+        }
+
+        fn flush(&mut self) {
+            for i in 0..self.counters.len() {
+                println!("counter {}: {}", i, self.counters[i]);
+            }
+        }
+    }
+
+    #[ignore]
+    #[test]
+    fn heavy_concurrency_test() {
+
+        let test_strings = [
+            "1[INFO module_x]: testing message, thread #",
+            "2[INFO module_y]: testing message for thread #",
+            "3[INFO module_z]: another one message for thread #",
+            "4[INFO module_o]: a long long long long long long long long long long long long message for therad #",
+        ];
+
+        let lengths = [
+            test_strings[0].len(),
+            test_strings[1].len(),
+            test_strings[2].len(),
+            test_strings[3].len(),
+        ];
+
+        let buf_sz = 8192 * 4;
+
+        let iter_cnt = 10000;
+
+        let writer_obj: Box<dyn Writer> = Box::new(StubWriter {counters: [0u64;4], lengths});
+
+        let logger = Arc::new(AsyncLoggerNB::new(writer_obj, buf_sz).expect("Failed to create new async logger"));
+
+        for i in 1..10000+1 {
+            spawn_threads(&logger, &test_strings, iter_cnt, iter_cnt/50);
+            if i%100 == 0 {
+                println!("{}", i);
+            }
+        }
+
+        match Arc::try_unwrap(logger) {
+            Ok(logger) => logger.terminate(),
+            Err(_) => panic!("Failed to terminate logger because it is still used"),
+        };
     }
 }
