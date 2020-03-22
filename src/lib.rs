@@ -624,17 +624,17 @@ mod tests {
             test_strings[3].len(),
         ];
 
-        let buf_sz = 8192 * 4;
+        let buf_sz = 8192;
 
-        let iter_cnt = 10000;
+        let iter_cnt = 100000;
 
         let writer_obj: Box<dyn Writer> = Box::new(StubWriter {counters: [0u64;4], lengths});
 
         let logger = Arc::new(AsyncLoggerNB::new(writer_obj, buf_sz).expect("Failed to create new async logger"));
 
-        for i in 1..10000+1 {
-            spawn_threads(&logger, &test_strings, iter_cnt, iter_cnt/50);
-            if i%100 == 0 {
+        for i in 1..1000+1 {
+            spawn_threads(&logger, &test_strings, iter_cnt, iter_cnt/100);
+            if i%10 == 0 {
                 println!("{}", i);
             }
         }

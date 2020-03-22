@@ -1,6 +1,6 @@
 [package]
 name = "async_logger"
-version = "0.2.2"
+version = "0.2.3"
 authors = ["stencillogic <stencillogic@gmail.com>"]
 edition = "2018"
 license = "MIT"

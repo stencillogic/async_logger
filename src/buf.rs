@@ -78,25 +78,6 @@ impl Buf {
     }
 
 
-    /// increment value of atomic, and return old value
-    fn inc_atomic_var(atomic: &AtomicUsize, val: usize) -> usize {
-        let mut prev_val = 0;
-        loop {
-            let cur_val = atomic.compare_and_swap(
-                prev_val,
-                prev_val + val,
-                Ordering::Relaxed,
-            );
-
-            if cur_val == prev_val {
-                return cur_val;
-            }
-
-            prev_val = cur_val;
-        }
-    }
-
-
     /// Returns tuple of `bool` and `bool`: "data is written", and "notify writer"
     fn write_slice(&self, slice: &[u8]) -> (bool, bool) {
 
@@ -121,8 +102,6 @@ impl Buf {
                 return (false, false);
             }
 
-            compiler_fence(Ordering::SeqCst);
-
             let cur_acq_size = self.acquire_size.compare_and_swap(
                 prev_acq_size,
                 prev_acq_size + reserve_size,
@@ -135,7 +114,7 @@ impl Buf {
 
                     if self.size > cur_acq_size {
                         let done_size = self.size - cur_acq_size;
-                        let total_done = Self::inc_atomic_var(&self.done_size, done_size) + done_size;
+                        let total_done = self.done_size.fetch_add(done_size, Ordering::Relaxed) + done_size;
                         return (false, total_done == self.size);
                     }
 
@@ -143,7 +122,7 @@ impl Buf {
 
                 } else {
 
-                    Self::inc_atomic_var(&self.used_size, reserve_size);
+                    self.used_size.fetch_add(reserve_size, Ordering::Relaxed);
 
                     unsafe {
 
@@ -152,7 +131,7 @@ impl Buf {
                                        reserve_size);
                     }
 
-                    let total_done = Self::inc_atomic_var(&self.done_size, reserve_size) + reserve_size;
+                    let total_done = self.done_size.fetch_add(reserve_size, Ordering::Relaxed) + reserve_size;
                     return (true, total_done == self.size);
                 }
 
@@ -178,8 +157,6 @@ impl Buf {
                 return false;
             }
 
-            compiler_fence(Ordering::SeqCst);
-
             let cur_acq_size = self.acquire_size.compare_and_swap(
                 prev_acq_size,
                 prev_acq_size + reserve_size,
@@ -191,7 +168,7 @@ impl Buf {
                 if self.size > cur_acq_size {
 
                     let done_size = self.size - cur_acq_size;
-                    let total_done = Self::inc_atomic_var(&self.done_size, done_size) + done_size;
+                    let total_done = self.done_size.fetch_add(done_size, Ordering::Relaxed) + done_size;
 
                     return total_done == self.size;
                 }
