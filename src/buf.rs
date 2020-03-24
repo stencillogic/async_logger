@@ -13,15 +13,19 @@ thread_local! {
 }
 
 
+#[repr(align(64))]
+struct CacheAligned<T> (T);
+
+
 /// Shared buffer which allows reserving mutable areas of memory concurrently.
 /// # Safety
 /// This structure is internal, and can't be considered safe by itself.
 pub struct Buf {
+    acquire_size:   CacheAligned<AtomicUsize>,
+    done_size:      CacheAligned<AtomicUsize>,
+    used_size:      AtomicUsize,
     ptr:            *mut u8,
     size:           usize,
-    used_size:      AtomicUsize,
-    acquire_size:   AtomicUsize,
-    done_size:      AtomicUsize,
 }
 
 impl Buf {
@@ -56,11 +60,11 @@ impl Buf {
         } else {
 
             Ok(Buf {
+                acquire_size: CacheAligned(AtomicUsize::new(0)),
+                done_size: CacheAligned(AtomicUsize::new(0)),
+                used_size: AtomicUsize::new(0),
                 ptr,
                 size,
-                used_size: AtomicUsize::new(0),
-                acquire_size: AtomicUsize::new(0),
-                done_size: AtomicUsize::new(0),
             })
         }
     }
@@ -70,11 +74,11 @@ impl Buf {
     fn reset(&self) {
 
         self.used_size.store(0, Ordering::Relaxed);
-        self.done_size.store(0, Ordering::Relaxed);
+        self.done_size.0.store(0, Ordering::Relaxed);
 
         compiler_fence(Ordering::SeqCst);
 
-        self.acquire_size.store(0, Ordering::Relaxed);
+        self.acquire_size.0.store(0, Ordering::Relaxed);
     }
 
 
@@ -93,7 +97,7 @@ impl Buf {
             return (false, false);
         }
 
-        let mut prev_acq_size = self.acquire_size.load(Ordering::Relaxed);
+        let mut prev_acq_size = self.acquire_size.0.load(Ordering::Relaxed);
 
         loop {
 
@@ -102,7 +106,7 @@ impl Buf {
                 return (false, false);
             }
 
-            let cur_acq_size = self.acquire_size.compare_and_swap(
+            let cur_acq_size = self.acquire_size.0.compare_and_swap(
                 prev_acq_size,
                 prev_acq_size + reserve_size,
                 Ordering::Relaxed,
@@ -114,7 +118,7 @@ impl Buf {
 
                     if self.size > cur_acq_size {
                         let done_size = self.size - cur_acq_size;
-                        let total_done = self.done_size.fetch_add(done_size, Ordering::Relaxed) + done_size;
+                        let total_done = self.done_size.0.fetch_add(done_size, Ordering::Relaxed) + done_size;
                         return (false, total_done == self.size);
                     }
 
@@ -131,7 +135,7 @@ impl Buf {
                                        reserve_size);
                     }
 
-                    let total_done = self.done_size.fetch_add(reserve_size, Ordering::Relaxed) + reserve_size;
+                    let total_done = self.done_size.0.fetch_add(reserve_size, Ordering::Relaxed) + reserve_size;
                     return (true, total_done == self.size);
                 }
 
@@ -148,7 +152,7 @@ impl Buf {
         
         let reserve_size = self.size + 1;
 
-        let mut prev_acq_size = self.acquire_size.load(Ordering::Relaxed);
+        let mut prev_acq_size = self.acquire_size.0.load(Ordering::Relaxed);
 
         loop {
 
@@ -157,7 +161,7 @@ impl Buf {
                 return false;
             }
 
-            let cur_acq_size = self.acquire_size.compare_and_swap(
+            let cur_acq_size = self.acquire_size.0.compare_and_swap(
                 prev_acq_size,
                 prev_acq_size + reserve_size,
                 Ordering::Relaxed,
@@ -168,7 +172,7 @@ impl Buf {
                 if self.size > cur_acq_size {
 
                     let done_size = self.size - cur_acq_size;
-                    let total_done = self.done_size.fetch_add(done_size, Ordering::Relaxed) + done_size;
+                    let total_done = self.done_size.0.fetch_add(done_size, Ordering::Relaxed) + done_size;
 
                     return total_done == self.size;
                 }

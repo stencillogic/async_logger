@@ -218,7 +218,7 @@ impl Error {
         }
     }
 
-    /// For kind IoError return associated io error.
+    /// For kind TimeError return associated io error.
     pub fn time_err(self) -> Option<std::time::SystemTimeError> {
         match self.repr {
             ErrorRepr::TimeError(e) => Some(e),
@@ -226,7 +226,7 @@ impl Error {
         }
     }
 
-    /// For kind IoError return associated io error.
+    /// For kind MemoryLayoutError return associated io error.
     pub fn layout_err(self) -> Option<std::alloc::LayoutErr> {
         match self.repr {
             ErrorRepr::MemoryLayoutError(e) => Some(e),
@@ -234,6 +234,7 @@ impl Error {
         }
     }
 
+    /// Returns kind of error.
     pub fn kind(&self) -> ErrorKind {
         self.kind
     }
@@ -624,19 +625,17 @@ mod tests {
             test_strings[3].len(),
         ];
 
-        let buf_sz = 8192;
+        let buf_sz = 8192 * 8;
 
-        let iter_cnt = 100000;
+        let iter_cnt = 10000000;
 
         let writer_obj: Box<dyn Writer> = Box::new(StubWriter {counters: [0u64;4], lengths});
 
         let logger = Arc::new(AsyncLoggerNB::new(writer_obj, buf_sz).expect("Failed to create new async logger"));
 
-        for i in 1..1000+1 {
+        for i in 1..25+1 {
             spawn_threads(&logger, &test_strings, iter_cnt, iter_cnt/100);
-            if i%10 == 0 {
-                println!("{}", i);
-            }
+            println!("{}", i);
         }
 
         match Arc::try_unwrap(logger) {
