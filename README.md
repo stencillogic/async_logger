@@ -2,12 +2,12 @@
 
 ![Rust](https://github.com/stencillogic/async_logger/workflows/Rust/badge.svg)
 
-Asyncronous logger allows writing arbitrary u8 slices to a memory buffer, that then processed by a writer in it's own thread.
+Asynchronous logger allows writing arbitrary u8 slices to a memory buffer, that then processed by a writer in it's own thread.
 See [crate documentation](https://docs.rs/async_logger/) for more info.
 
 ## Intro
 
-`AsyncLoggerNB` is implementation of asyncronous logger that allows writing arbitrary `u8`
+`AsyncLoggerNB` is implementation of asynchronous logger that allows writing arbitrary `u8`
 slices to a memory buffer, and then send the buffer to a writer. 
 
 NB at the end of `AsyncLoggerNB` stands for non-blocking. Implementation allows adding messages to a buffer without locking
@@ -21,7 +21,7 @@ by multiple threads running on multiple cpu cores with high concurrency of write
 `FileWriter` that writes data to a file. You can create your own implementation of the `Writer`
 trait as well.
 
-Implementation of [log](https://docs.rs/log) facade based on this asyncronous logger is available as separate crate
+Implementation of [log](https://docs.rs/log) facade based on this asynchronous logger is available as separate crate
 [async_logger_log](https://docs.rs/async_logger_log). Please refer to `async_logger_log` crate documentation for more info and examples.
 
 ## Examples
