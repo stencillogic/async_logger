@@ -1,6 +1,6 @@
-//! Asyncronous logger.
+//! Asynchronous logger.
 //!
-//! `AsyncLoggerNB` is implementation of asyncronous logger that allows writing arbitrary `u8`
+//! `AsyncLoggerNB` is implementation of asynchronous logger that allows writing arbitrary `u8`
 //! slices to a memory buffer, and then send the buffer to a writer. 
 //!
 //! NB at the end of `AsyncLoggerNB` stands for non-blocking. Implementation allows adding messages to a buffer without locking
@@ -14,7 +14,7 @@
 //! `FileWriter` that writes data to a file. You can create your own implementation of the `Writer`
 //! trait as well.
 //!
-//! Implementation of [log](https://docs.rs/log) facade based on this asyncronous logger is available as separate crate
+//! Implementation of [log](https://docs.rs/log) facade based on this asynchronous logger is available as separate crate
 //! [async_logger_log](https://docs.rs/async_logger_log). Please refer to `async_logger_log` crate documentation for more info and examples.
 //!
 //! # Examples
@@ -50,7 +50,27 @@
 //! };
 //! ```
 //!
-
+//! # Performance
+//!
+//! Recommended buffer size is to let holding from tens to hundreds of
+//! messages. Choosing too small size leads to performance degradation. And choosing too big size
+//! doesn't increase performance significantly but leads to resource waste. 
+//!
+//! 65536 bytes is typical size.
+//!
+//! ## Performance tests
+//!
+//! Tests show that this non-blocking implementation is at least not slower than comparable
+//! implementation with mutex, and can be two times faster under highly competitive load.
+//!
+//! ## Metrics
+//!
+//! `AsyncLoggerNB` collects total time spent by threads waiting for free buffer space in nanoseconds,
+//! and total count of wait events. 
+//! Metrics collection is enabled at compile time with feature `metrics`.
+//! After enabling metrics you can use `AsyncLoggerNB::get_metrics` to get the current metrics values.
+//! Note, the metrics values can wrap around after significant amount of time of running without
+//! interruption.
 
 mod buf;
 mod writer;
@@ -60,6 +80,7 @@ use buf::DoubleBuf;
 use writer::ThreadedWriter;
 use std::sync::{Mutex, Arc};
 pub use writer::FileWriter;
+pub use buf::Metrics;
 
 
 
@@ -67,7 +88,7 @@ pub use writer::FileWriter;
 pub trait Writer: Send {
 
     /// Logger calls this function when there is data to be processed.
-    /// This function is guaranteed to be called sequentially; no internal syncronization is
+    /// This function is guaranteed to be called sequentially; no internal synchronization is
     /// required by default.
     fn process_slice(&mut self, slice: &[u8]);
 
@@ -185,6 +206,12 @@ impl AsyncLoggerNB {
     pub fn flush(&self) {
 
         self.buf.flush();
+    }
+
+
+    /// Return current values of performance metrics, e.g. wait event information.
+    pub fn get_metrics(&self) -> Metrics {
+        self.buf.get_metrics()
     }
 }
 
@@ -635,6 +662,7 @@ mod tests {
 
         for i in 1..25+1 {
             spawn_threads(&logger, &test_strings, iter_cnt, iter_cnt/100);
+            println!("{:?}", logger.get_metrics());
             println!("{}", i);
         }
 

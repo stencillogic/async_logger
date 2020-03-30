@@ -6,6 +6,10 @@ use std::cell::RefCell;
 use super::{Error, ErrorRepr, ErrorKind};
 
 
+#[cfg(feature = "metrics")]
+use std::sync::atomic::AtomicU64;
+
+
 // for optimization: storing last writable buf id optimistically expecting it will be writable the next
 // time we try to request a writable slice
 thread_local! {
@@ -220,12 +224,28 @@ impl Drop for Buf {
 unsafe impl Sync for Buf {}
 unsafe impl Send for Buf {}
 
+/// Metrics values.
+#[derive(Debug)]
+pub struct Metrics {
+    wait_time:   u64,
+    wait_count:  u64,
+}
+
+#[cfg(feature = "metrics")]
+struct MetricsInternal {
+    wait_time:      CacheAligned<AtomicU64>,
+    wait_count:     CacheAligned<AtomicU64>,
+}
+
 
 
 /// Doubled Buf instances (flip-flop buffer)
 #[derive(Clone)]
 pub struct DoubleBuf {
     bufs: Arc<Vec<Buf>>,
+
+    #[cfg(feature = "metrics")]
+    metrics: Arc<MetricsInternal>,
     buf_state: Arc<(Mutex<[BufState; 2]>, Condvar, Condvar)>,
     size: usize,
 }
@@ -241,11 +261,27 @@ impl DoubleBuf {
 
         let buf_state = Arc::new((Mutex::new([BufState::Appendable, BufState::Appendable]), Condvar::new(), Condvar::new()));
 
-        Ok(DoubleBuf {
-            bufs,
-            buf_state,
-            size: sz,
-        })
+        #[cfg(feature = "metrics")] {
+            let metrics = Arc::new(MetricsInternal {
+                wait_time: CacheAligned(AtomicU64::new(0)),
+                wait_count: CacheAligned(AtomicU64::new(0)),
+            });
+
+            Ok(DoubleBuf {
+                bufs,
+                metrics,
+                buf_state,
+                size: sz,
+            })
+        }
+
+        #[cfg(not(feature = "metrics"))] {
+            Ok(DoubleBuf {
+                bufs,
+                buf_state,
+                size: sz,
+            })
+        }
     }
 
 
@@ -301,11 +337,24 @@ impl DoubleBuf {
 
                 if appendable > 0 {
 
-                    std::thread::yield_now();
+                    #[cfg(feature = "metrics")] {
+                        let now = std::time::Instant::now();
+                        std::thread::yield_now();
 
-                    if appendable > 10000 {
-                        std::thread::sleep(std::time::Duration::new(0,10_000_000));
-                        appendable = 0;
+                        if appendable > 10000 {
+                            std::thread::sleep(std::time::Duration::new(0,10_000_000));
+                            appendable = 0;
+                        }
+                        self.inc_metrics(1, std::time::Instant::now().duration_since(now).as_nanos() as u64);
+                    }
+
+                    #[cfg(not(feature = "metrics"))] {
+                        std::thread::yield_now();
+
+                        if appendable > 10000 {
+                            std::thread::sleep(std::time::Duration::new(0,10_000_000));
+                            appendable = 0;
+                        }
                     }
                 }
 
@@ -354,7 +403,40 @@ impl DoubleBuf {
                 }
             }
 
-            cur_state = cvar.wait_timeout(cur_state, std::time::Duration::new(1, 0)).unwrap().0;
+            #[cfg(feature = "metrics")] {
+                let now = std::time::Instant::now();
+                cur_state = cvar.wait(cur_state).unwrap();
+                self.inc_metrics(1, std::time::Instant::now().duration_since(now).as_nanos() as u64);
+            }
+
+            #[cfg(not(feature = "metrics"))] {
+                cur_state = cvar.wait(cur_state).unwrap();
+            }
+        }
+    }
+
+
+    #[cfg(feature = "metrics")]
+    #[inline]
+    fn inc_metrics(&self, wait_cnt: u64, wait_time: u64) {
+        self.metrics.wait_time.0.fetch_add(wait_time, Ordering::Relaxed);
+        self.metrics.wait_count.0.fetch_add(wait_cnt, Ordering::Relaxed);
+    }
+
+
+    pub fn get_metrics(&self) -> Metrics {
+        #[cfg(feature = "metrics")] {
+            Metrics {
+                wait_time: self.metrics.wait_time.0.load(Ordering::Relaxed),
+                wait_count:  self.metrics.wait_count.0.load(Ordering::Relaxed),
+            }
+        }
+
+        #[cfg(not(feature = "metrics"))] {
+            Metrics {
+                wait_time:  0,
+                wait_count: 0,
+            }
         }
     }
 
@@ -375,7 +457,7 @@ impl DoubleBuf {
                 return cur_state[buf_id];
             }
 
-            cur_state = cvar.wait_timeout(cur_state, std::time::Duration::new(1, 0)).unwrap().0;
+            cur_state = cvar.wait(cur_state).unwrap();
         }
     }
 
