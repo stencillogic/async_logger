@@ -18,6 +18,7 @@
 //! [async_logger_log](https://docs.rs/async_logger_log). Please refer to `async_logger_log` crate documentation for more info and examples.
 //!
 //! # Examples
+//!
 //! ```
 //! use async_logger::FileWriter;
 //! use async_logger::AsyncLoggerNB;
@@ -25,7 +26,7 @@
 //!
 //! let writer = FileWriter::new("/tmp").expect("Failed to create file writer");
 //!
-//! let logger = Arc::new(AsyncLoggerNB::new(Box::new(writer), 1024)
+//! let logger = Arc::new(AsyncLoggerNB::new(Box::new(writer), 8192)
 //!     .expect("Failed to create new async logger"));
 //!
 //! let write_line = "Hello, world!\n";
@@ -50,6 +51,36 @@
 //! };
 //! ```
 //!
+//! When you know size of data to be written in beforehand it may be more efficient to write data
+//! directly to the logger buffer. For that case `AsyncLoggerNB::reserve_bytes` can be used:
+//!
+//! ```
+//! use async_logger::{FileWriter, AsyncLoggerNB, Writer};
+//!
+//! // implement some custom writer along the way
+//! struct Stub {}
+//! impl Writer for Stub {
+//!     fn process_slice(&mut self, slice: &[u8]) {}
+//!     fn flush(&mut self) {}
+//! }
+//!
+//! let logger = AsyncLoggerNB::new(Box::new(Stub {}), 8192)
+//!     .expect("Failed to create new async logger");
+//!
+//! // getting slice for writing
+//! let mut bytes = logger.reserve_bytes(10).unwrap();
+//!
+//! assert_eq!(10, bytes.len());
+//!
+//! // write to the logger buffer directly
+//! for i in 0..10 {
+//!     bytes[i] = (i*i) as u8;
+//! }
+//!
+//! drop(bytes);    // release the buffer
+//!
+//! ```
+//!
 //! # Performance
 //!
 //! Recommended buffer size is to let holding from tens to hundreds of
@@ -58,12 +89,12 @@
 //!
 //! 65536 bytes is typical size.
 //!
-//! ## Performance tests
+//! ### Performance tests
 //!
 //! Tests show that this non-blocking implementation is at least not slower than comparable
 //! implementation with mutex, and can be two times faster under highly competitive load.
 //!
-//! ## Metrics
+//! ### Metrics
 //!
 //! `AsyncLoggerNB` collects total time spent by threads waiting for free buffer space in nanoseconds,
 //! and total count of wait events. 
@@ -71,6 +102,10 @@
 //! After enabling metrics you can use `AsyncLoggerNB::get_metrics` to get the current metrics values.
 //! Note, the metrics values can wrap around after significant amount of time of running without
 //! interruption.
+//!
+//! # Notes
+//!
+//! Attempting to get several instances of `Byte` struct in the same thread can cause deadlock.
 
 mod buf;
 mod writer;
@@ -81,7 +116,7 @@ use writer::ThreadedWriter;
 use std::sync::{Mutex, Arc};
 pub use writer::FileWriter;
 pub use buf::Metrics;
-
+pub use buf::Bytes;
 
 
 /// Writer performs data processing of a fully filled buffer.
@@ -179,7 +214,7 @@ impl AsyncLoggerNB {
     ///
     /// # Panics
     ///
-    /// This function panics if some of the internal mutexes is poisoned or when writer panics.
+    /// This function panics if some of the internal mutexes is poisoned or when writer thread panics.
     pub fn write_slice(&self, slice: &[u8]) -> Result<(),()> {
 
         if slice.len() >= self.threshold {
@@ -196,8 +231,59 @@ impl AsyncLoggerNB {
         Ok(())
     }
 
+
+    /// This function is similar to `write_slice` but instead of pushing some slice to buffer it allows
+    /// reserving some space for writing directly in the underlying destination buffer. This way excessive
+    /// copy operation from the slice to the internal buffer can be avoided.
+    /// Thus, this function is more preferable than `write_slice` but is applicable only when you know the size of the slice you need
+    /// beforehand. When the size of the slice doesn't matter use `reserve_bytes_relaxed`.
+    ///
+    /// The function returns `Bytes` struct that can be dereferenced as mutable slice of `u8`. The
+    /// client code can use the dereferenced slice to write to it. The client code holds the buffer
+    /// until `Bytes` instance goes out of scope or is explicitly dropped with `drop`. That
+    /// means client's code must take care of not holding the returned `Bytes` instance for too long
+    /// because it can block other threads.
+    /// 
+    /// # Errors
+    ///
+    /// If the `reserve_size` is larger or equal to 0.8 * buffer_size then `Err` is returned with
+    /// `ErrorKind::RequestedSizeIsTooLong`.
+    ///
+    /// `Err` is also returned when the function is called after `terminate` was called, but
+    /// this is normally not expected, because `terminate` takes ownership on logger instance.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if some of the internal mutexes is poisoned or when writer thread panics.
+    pub fn reserve_bytes(&self, reserve_size: usize) -> Result<Bytes,Error> {
+
+        if reserve_size >= self.threshold {
+            return Err(Error::new(ErrorKind::RequestedSizeIsTooLong, ErrorRepr::Simple));
+        } else {
+            return self.buf.reserve_bytes(reserve_size, false);
+        }
+    }
+
+
+    /// This function is similar to `reserve_bytes` but returned `Bytes` struct can have length  
+    /// from 1 byte, and up to `reserve_size` bytes.
+    ///
+    /// # Errors
+    ///
+    /// `Err` is returned when the function is called after `terminate` was called.
+    /// This is normally not expected, because `terminate` takes ownership on logger instance.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if some of the internal mutexes is poisoned or when writer thread panics.
+    #[inline]
+    pub fn reserve_bytes_relaxed(&self, reserve_size: usize) -> Result<Bytes,()> {
+
+        return self.buf.reserve_bytes(reserve_size, true).map_err(|_| {()});
+    }
+
     /// Mark not yet full buffer as ready for writer.
-    /// This function doesn't call `Writer::flush.
+    /// This function doesn't call `Writer::flush`.
     /// This function doesn't wait while writer process all the previously written data.
     ///
     /// # Panics
@@ -279,6 +365,8 @@ pub enum ErrorKind {
     IncorrectBufferSize,
     AllocFailure,
     MemoryLayoutError,
+    LoggerIsTerminated,
+    RequestedSizeIsTooLong,
 }
 
 #[derive(Debug)]
@@ -363,7 +451,24 @@ mod tests {
             let handle = thread::spawn(move || {
 
                 for i in 1..cnt+1 {
-                    logger_c.write_slice(s.as_bytes()).unwrap();
+                    if i & 0x1 == 0 {
+                        logger_c.write_slice(s.as_bytes()).unwrap();
+                    } else {
+                        match logger_c.reserve_bytes(s.as_bytes().len()) {
+                            Ok(mut bytes) => {
+                                let dst = &mut bytes;
+                                dst.copy_from_slice(s.as_bytes());
+                                drop(bytes);
+                            },
+                            Err(e) => {
+                                if e.kind() == ErrorKind::RequestedSizeIsTooLong {
+                                    logger_c.write_slice(s.as_bytes()).unwrap();
+                                } else {
+                                    panic!("Unexpected error: {:?}", e);
+                                }
+                            }
+                        }
+                    }
 
                     if i % flush_cnt == 0 {
                         logger_c.flush();

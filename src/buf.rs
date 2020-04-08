@@ -150,6 +150,82 @@ impl Buf {
         }
     }
 
+    /// Returns Bytes instance, and "notify writer"
+    fn reserve_bytes(&self, reserve_size: usize, relaxed: bool) -> (Option<&mut [u8]>, bool) {
+
+        if reserve_size == 0 {
+
+            return (Some(&mut []), false);
+        }
+
+        if reserve_size > self.size || reserve_size > std::usize::MAX - self.size {
+
+            return (None, false);
+        }
+
+        let mut prev_acq_size = self.acquire_size.0.load(Ordering::Relaxed);
+
+        loop {
+
+            if prev_acq_size > self.size {
+
+                return (None, false);
+            }
+
+            let cur_acq_size = self.acquire_size.0.compare_and_swap(
+                prev_acq_size,
+                prev_acq_size + reserve_size,
+                Ordering::Relaxed,
+            );
+
+            if cur_acq_size == prev_acq_size {
+
+                if cur_acq_size + reserve_size > self.size {
+
+                    if self.size > cur_acq_size {
+                        let done_size = self.size - cur_acq_size;
+                        if relaxed {
+                            self.used_size.fetch_add(done_size, Ordering::Relaxed);
+
+                            let slice;
+                            unsafe {
+
+                                slice = std::slice::from_raw_parts_mut(self.ptr.offset(cur_acq_size as isize), done_size);
+                            }
+
+                            return (Some(slice), true);
+                        } else {
+                            let total_done = self.done_size.0.fetch_add(done_size, Ordering::Relaxed) + done_size;
+                            return (None, total_done == self.size);
+                        }
+                    }
+
+                    return (None, false);
+
+                } else {
+
+                    self.used_size.fetch_add(reserve_size, Ordering::Relaxed);
+
+                    let slice;
+                    unsafe {
+
+                        slice = std::slice::from_raw_parts_mut(self.ptr.offset(cur_acq_size as isize), reserve_size);
+                    }
+
+                    return (Some(slice), true);
+                }
+
+            } else {
+
+                prev_acq_size = cur_acq_size;
+            }
+        }
+    }
+
+    #[inline]
+    fn inc_done_size(&self, reserve_size: usize) -> usize {
+        return self.done_size.0.fetch_add(reserve_size, Ordering::Relaxed) + reserve_size;
+    }
     
     /// try to take up all remaining space, return true if to notify writer
     fn reserve_rest(&self) -> bool {
@@ -284,7 +360,6 @@ impl DoubleBuf {
         }
     }
 
-
     /// return number of buffers
     #[inline]
     pub fn get_buf_cnt(&self) -> usize {
@@ -309,6 +384,29 @@ impl DoubleBuf {
         }
 
         return is_written;
+    }
+
+    fn try_reserve(&self, buf_id: usize, reserve_size: usize, relaxed: bool) -> Option<Bytes> {
+
+        match self.bufs[buf_id].reserve_bytes(reserve_size, relaxed) {
+            (None, notify) => {
+                if notify {
+                    self.set_buf_readable(buf_id);
+                }
+                return None;
+            },
+            (Some(slice), _) => {
+                CUR_BUF.with( |v| {
+                    *v.borrow_mut() = buf_id; 
+                });
+
+                return Some(Bytes {
+                    slice,
+                    parent: self,
+                    buf_id,
+                });
+            }
+        }
     }
 
     /// Write data.
@@ -363,6 +461,66 @@ impl DoubleBuf {
                 if state == BufState::Terminated {
 
                     return Err(());
+                }
+
+                cur_buf = buf_id;
+
+                appendable += 1;
+            }
+        }
+    }
+
+
+    /// Reserve slice for write.
+    pub fn reserve_bytes(&self, reserve_size: usize, relaxed: bool) -> Result<Bytes, Error> {
+
+        let mut cur_buf = 0;
+
+        CUR_BUF.with( |v| {
+            cur_buf = *v.borrow(); 
+        });
+
+        let mut appendable = 0;
+
+        loop {
+
+            if let Some(bytes) = self.try_reserve(cur_buf, reserve_size, relaxed) {
+
+                return Ok(bytes);
+
+            } else if let Some(bytes) = self.try_reserve(1 - cur_buf, reserve_size, relaxed) {
+
+                return Ok(bytes);
+
+            } else {
+
+                if appendable > 0 {
+
+                    #[cfg(feature = "metrics")] {
+                        let now = std::time::Instant::now();
+                        std::thread::yield_now();
+
+                        if appendable > 10000 {
+                            std::thread::sleep(std::time::Duration::new(0,10_000_000));
+                            appendable = 0;
+                        }
+                        self.inc_metrics(1, std::time::Instant::now().duration_since(now).as_nanos() as u64);
+                    }
+
+                    #[cfg(not(feature = "metrics"))] {
+                        std::thread::yield_now();
+
+                        if appendable > 10000 {
+                            std::thread::sleep(std::time::Duration::new(0,10_000_000));
+                            appendable = 0;
+                        }
+                    }
+                }
+
+                let (buf_id, state) = self.wait_for(BufState::Appendable as u32 | BufState::Terminated as u32);
+
+                if state == BufState::Terminated {
+                    return Err(Error::new(ErrorKind::LoggerIsTerminated, ErrorRepr::Simple));
                 }
 
                 cur_buf = buf_id;
@@ -570,6 +728,8 @@ impl DoubleBuf {
 }
 
 
+use std::ops::{Deref, DerefMut};
+
 
 /// Buffer states for buffer tracking
 #[derive(Copy, Clone, PartialEq, Debug)]
@@ -577,6 +737,42 @@ enum BufState {
     Appendable = 0b001,
     Readable = 0b010,
     Terminated = 0b100,
+}
+
+/// Wrapper for writable slice of [u8].
+pub struct Bytes<'a> {
+    slice:  &'a mut [u8],
+    parent: &'a DoubleBuf,
+    buf_id: usize,
+}
+
+
+impl<'a> Deref for Bytes<'a> {
+
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.slice
+    }
+}
+
+impl<'a> DerefMut for Bytes<'a> {
+
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.slice
+    }
+}
+
+impl<'a> Drop for Bytes<'a> {
+
+    fn drop(&mut self) {
+
+        let buf = &self.parent.bufs[self.buf_id];
+        let total_done = buf.inc_done_size(self.slice.len());
+        if total_done == self.parent.size {
+            self.parent.set_buf_readable(self.buf_id);
+        }
+    }
 }
 
 
