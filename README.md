@@ -2,13 +2,13 @@
 
 ![Rust](https://github.com/stencillogic/async_logger/workflows/Rust/badge.svg)
 
-Asynchronous logger allows writing arbitrary u8 slices to a memory buffer, that then processed by a writer in it's own thread.
+Asynchronous logger allows writing arbitrary slices to a memory buffer, that then processed by a writer in it's own thread.
 See [crate documentation](https://docs.rs/async_logger/) for more info.
 
 ## Intro
 
-`AsyncLoggerNB` is implementation of asynchronous logger that allows writing arbitrary `u8`
-slices to a memory buffer, and then send the buffer to a writer. 
+`AsyncLoggerNB` is implementation of asynchronous logger that allows writing arbitrary slices to a memory buffer, 
+and then send the buffer to a writer. 
 
 NB at the end of `AsyncLoggerNB` stands for non-blocking. Implementation allows adding messages to a buffer without locking
 the buffer which prevents other threads from writing. `AsyncLoggerNB` uses pair of fixed size buffers; 
@@ -16,6 +16,8 @@ while one buffer is being written by the multiple threads, the second is being p
 single writer thread. Blocking appears when buffers change their roles.
 Thus, this implementation is applicable in situation of small (compared to the size of buffer) writes
 by multiple threads running on multiple cpu cores with high concurrency of writes.
+
+`AsyncLoggerNB` can process serialized data (stream of bytes) or custom complex data structures, references to objects.
 
 `AsyncLoggerNB` can accept any writer implementation of `Writer` trait. This package includes
 `FileWriter` that writes data to a file. You can create your own implementation of the `Writer`
@@ -33,7 +35,7 @@ use std::{thread, sync::Arc};
 
 let writer = FileWriter::new("/tmp").expect("Failed to create file writer");
 
-let logger = Arc::new(AsyncLoggerNB::new(Box::new(writer), 1024)
+let logger = Arc::new(AsyncLoggerNB::new(Box::new(writer), 8192)
     .expect("Failed to create new async logger"));
 
 let write_line = "Hello, world!\n";

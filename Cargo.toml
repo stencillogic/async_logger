@@ -1,10 +1,10 @@
 [package]
 name = "async_logger"
-version = "0.2.7"
+version = "0.3.0"
 authors = ["stencillogic <stencillogic@gmail.com>"]
 edition = "2018"
 license = "MIT"
-description = "Asyncronous logger allows writing arbitrary u8 slices to a memory buffer, which then processed by a writer in it's own thread."
+description = "Asyncronous logger allows writing arbitrary slices to a memory buffer, which then processed by a writer in it's own thread."
 categories = ["asynchronous", "concurrency"]
 keywords = ["async", "logging", "logger"]
 repository = "https://github.com/stencillogic/async_logger"
