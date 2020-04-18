@@ -1,14 +1,16 @@
 //! Asynchronous logger.
 //!
-//! `AsyncLoggerNB` is implementation of asynchronous logger that allows writing arbitrary `u8`
-//! slices to a memory buffer, and then send the buffer to a writer. 
+//! `AsyncLoggerNB` is implementation of asynchronous logger that allows writing arbitrary 
+//! slices or individual values to a memory buffer, and then send the buffer to a writer. 
 //!
 //! NB at the end of `AsyncLoggerNB` stands for non-blocking. Implementation allows adding messages to a buffer without locking
-//! the buffer which prevents other threads from writing. `AsyncLoggerNB` uses pair of fixed size buffers; 
+//! the buffer which prevents other threads from waiting. `AsyncLoggerNB` uses pair of fixed size buffers; 
 //! while one buffer is being written by the multiple threads, the second is being proccessed by the
 //! single writer thread. Blocking appears when buffers change their roles.
 //! Thus, this implementation is applicable in situation of small (compared to the size of buffer) writes
 //! by multiple threads running on multiple cpu cores with high concurrency of writes.
+//!
+//! `AsyncLoggerNB` can process serialized data (stream of bytes) or custom complex data structures, references to objects.
 //!
 //! `AsyncLoggerNB` can accept any writer implementation of `Writer` trait. This package includes
 //! `FileWriter` that writes data to a file. You can create your own implementation of the `Writer`
@@ -52,15 +54,19 @@
 //! ```
 //!
 //! When you know size of data to be written in beforehand it may be more efficient to write data
-//! directly to the logger buffer. For that case `AsyncLoggerNB::reserve_bytes` can be used:
+//! directly to the logger buffer. For that case `AsyncLoggerNB::reserve_slice` can be used:
 //!
 //! ```
 //! use async_logger::{FileWriter, AsyncLoggerNB, Writer};
 //!
 //! // implement some custom writer along the way
 //! struct Stub {}
-//! impl Writer for Stub {
-//!     fn process_slice(&mut self, slice: &[u8]) {}
+//! impl Writer<u8> for Stub {
+//!     fn process_slice(&mut self, slice: &[u8]) {
+//!         for item in slice {
+//!             println!("{}", item);
+//!         }
+//!     }
 //!     fn flush(&mut self) {}
 //! }
 //!
@@ -68,18 +74,23 @@
 //!     .expect("Failed to create new async logger");
 //!
 //! // getting slice for writing
-//! let mut bytes = logger.reserve_bytes(10).unwrap();
+//! let mut slice = logger.reserve_slice(10).unwrap();
 //!
-//! assert_eq!(10, bytes.len());
+//! assert_eq!(10, slice.len());
 //!
 //! // write to the logger buffer directly
 //! for i in 0..10 {
-//!     bytes[i] = (i*i) as u8;
+//!     slice[i] = (i*i) as u8;
 //! }
 //!
-//! drop(bytes);    // release the buffer
+//! drop(slice);    // release the buffer
 //!
 //! ```
+//!
+//! Sometimes it is more efficient to write a pointer to some existing instance of struct instead
+//! of copying the complete object. This can be achieved by moving boxed reference to an object to
+//! `AsyncLoggerNB::write_value`. See the documentation of the function 
+//! [write_value](struct.AsyncLoggerNB.html#method.write_value) for details and example.
 //!
 //! # Performance
 //!
@@ -105,7 +116,7 @@
 //!
 //! # Notes
 //!
-//! Attempting to get several instances of `Byte` struct in the same thread can cause deadlock.
+//! Attempting to get several instances of `Byte` struct at the same time in the same thread can cause deadlock.
 
 mod buf;
 mod writer;
@@ -116,16 +127,16 @@ use writer::ThreadedWriter;
 use std::sync::{Mutex, Arc};
 pub use writer::FileWriter;
 pub use buf::Metrics;
-pub use buf::Bytes;
+pub use buf::Slice;
 
 
 /// Writer performs data processing of a fully filled buffer.
-pub trait Writer: Send {
+pub trait Writer<T: Send + 'static>: Send {
 
     /// Logger calls this function when there is data to be processed.
     /// This function is guaranteed to be called sequentially; no internal synchronization is
     /// required by default.
-    fn process_slice(&mut self, slice: &[u8]);
+    fn process_slice(&mut self, slice: &[T]);
 
     /// Flush the remining data, and finalize writer. 
     /// This function is called only on writer thread termination.
@@ -135,30 +146,30 @@ pub trait Writer: Send {
 
 
 /// Logger with non-blocking async processing.
-pub struct AsyncLoggerNB {
-    buf:    DoubleBuf,
+pub struct AsyncLoggerNB<T: Send + 'static> {
+    buf:    DoubleBuf<T>,
     tw:     ThreadedWriter,
-    writer: Arc<Mutex<Box<dyn Writer>>>,
+    writer: Arc<Mutex<Box<dyn Writer<T>>>>,
     terminated: Arc<Mutex<bool>>,
     threshold:  usize,
 }
 
 
-impl AsyncLoggerNB {
+impl<T: Send + 'static> AsyncLoggerNB<T> {
 
-    /// Create a new AsyncLoggerNB instance with buffer of buf_size.
+    /// Create a new AsyncLoggerNB instance with buffer of buf_size items.
     ///
     /// # Errors
     ///
-    /// `Err` is returend if `buf_sz` is greater than `std::isize::MAX` or `buf_sz` is zero, or 
-    /// if memory allocation has failed for some reason (e.g. OOM).
+    /// `Err` is returend if `buf_sz` is greater than `std::isize::MAX` or `buf_sz` is zero or when
+    /// `T` has size of zero, or when memory allocation has failed for some reason (e.g. OOM).
     ///
     /// # Panics
     ///
     /// Panics of OS fails to create thread.
-    pub fn new(writer: Box<dyn Writer>, buf_sz: usize) -> Result<AsyncLoggerNB, Error> {
+    pub fn new(writer: Box<dyn Writer<T>>, buf_sz: usize) -> Result<AsyncLoggerNB<T>, Error> {
 
-        let buf = DoubleBuf::new(buf_sz)?;
+        let buf = DoubleBuf::<T>::new(buf_sz)?;
 
         let writer = Arc::new(Mutex::new(writer));
 
@@ -201,7 +212,7 @@ impl AsyncLoggerNB {
         }
     }
 
-    /// Write a slice of `u8`. If the size of slice is larger or equal to 0.8 * buffer_size then buffer is
+    /// Write a slice of `<T>`. If the size of slice is larger or equal to 0.8 * buffer_size then buffer is
     /// bypassed, and slice is handed directly to writer. Note, in this case message can appear
     /// out-of-order.
     /// Function blocks if message size is less than 0.8 * buffer_size, and there is not enough free space in any of buffers. 
@@ -215,7 +226,7 @@ impl AsyncLoggerNB {
     /// # Panics
     ///
     /// This function panics if some of the internal mutexes is poisoned or when writer thread panics.
-    pub fn write_slice(&self, slice: &[u8]) -> Result<(),()> {
+    pub fn write_slice(&self, slice: &[T]) -> Result<(),()> where T: Copy {
 
         if slice.len() >= self.threshold {
 
@@ -236,12 +247,12 @@ impl AsyncLoggerNB {
     /// reserving some space for writing directly in the underlying destination buffer. This way excessive
     /// copy operation from the slice to the internal buffer can be avoided.
     /// Thus, this function is more preferable than `write_slice` but is applicable only when you know the size of the slice you need
-    /// beforehand. When the size of the slice doesn't matter use `reserve_bytes_relaxed`.
+    /// beforehand. When the size of the slice doesn't matter use `reserve_slice_relaxed`.
     ///
-    /// The function returns `Bytes` struct that can be dereferenced as mutable slice of `u8`. The
+    /// The function returns `Slice` struct that can be dereferenced as mutable slice of `<T>`. The
     /// client code can use the dereferenced slice to write to it. The client code holds the buffer
-    /// until `Bytes` instance goes out of scope or is explicitly dropped with `drop`. That
-    /// means client's code must take care of not holding the returned `Bytes` instance for too long
+    /// until `Slice` instance goes out of scope or is explicitly dropped with `drop`. That
+    /// means client's code must take care of not holding the returned `Slice` instance for too long
     /// because it can block other threads.
     /// 
     /// # Errors
@@ -255,18 +266,18 @@ impl AsyncLoggerNB {
     /// # Panics
     ///
     /// This function panics if some of the internal mutexes is poisoned or when writer thread panics.
-    pub fn reserve_bytes(&self, reserve_size: usize) -> Result<Bytes,Error> {
+    pub fn reserve_slice(&self, reserve_size: usize) -> Result<Slice<T>,Error> where T: Copy {
 
         if reserve_size >= self.threshold {
             return Err(Error::new(ErrorKind::RequestedSizeIsTooLong, ErrorRepr::Simple));
         } else {
-            return self.buf.reserve_bytes(reserve_size, false);
+            return self.buf.reserve_slice(reserve_size, false);
         }
     }
 
 
-    /// This function is similar to `reserve_bytes` but returned `Bytes` struct can have length  
-    /// from 1 byte, and up to `reserve_size` bytes.
+    /// This function is similar to `reserve_slice` but returned `Slice` struct can have length  
+    /// from 1 item, and up to `reserve_size` items.
     ///
     /// # Errors
     ///
@@ -277,9 +288,54 @@ impl AsyncLoggerNB {
     ///
     /// This function panics if some of the internal mutexes is poisoned or when writer thread panics.
     #[inline]
-    pub fn reserve_bytes_relaxed(&self, reserve_size: usize) -> Result<Bytes,()> {
+    pub fn reserve_slice_relaxed(&self, reserve_size: usize) -> Result<Slice<T>,()> {
 
-        return self.buf.reserve_bytes(reserve_size, true).map_err(|_| {()});
+        return self.buf.reserve_slice(reserve_size, true).map_err(|_| {()});
+    }
+
+    /// Write a value of type `<T>`. This method can be used for writing values that do not
+    /// implement `Copy` trait, e.g. `String`, or pointer to a string `Box<String>`. The function
+    /// takes ownership of the argument. After the argument is processed by writer `drop` for it is
+    /// called automatically.
+    /// 
+    /// Function blocks if there is not enough free space in any of buffers. 
+    /// As soon as there is free space available value is written and function returns.
+    ///
+    /// # Errors
+    ///
+    /// `Err` is returned when the function tries to put value in buffer after `terminate` was called. 
+    /// This is normally not expected, because `terminate` takes ownership on logger instance.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if some of the internal mutexes is poisoned or when writer thread panics.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_logger::{FileWriter, AsyncLoggerNB, Writer};
+    ///
+    /// // implement some custom writer along the way
+    /// struct Stub {}
+    /// impl Writer<Box<String>> for Stub {
+    ///     fn process_slice(&mut self, slice: &[Box<String>]) {}
+    ///     fn flush(&mut self) {}
+    /// }
+    ///
+    /// let writer_obj: Box<dyn Writer<Box<String>>> = Box::new(Stub {});
+    ///
+    /// let logger = AsyncLoggerNB::new(Box::new(Stub {}), 8192)
+    ///     .expect("Failed to create new async logger");
+    ///
+    /// let stringPtr = Box::new("test message".to_owned());
+    /// logger.write_value(stringPtr).unwrap();
+    ///
+    /// ```
+    pub fn write_value(&self, value: T) -> Result<(),()> {
+        let slice = [value];
+        self.buf.write_slice(&slice)?;
+        std::mem::forget(slice);
+        Ok(())
     }
 
     /// Mark not yet full buffer as ready for writer.
@@ -331,7 +387,7 @@ impl Error {
         }
     }
 
-    /// For kind TimeError return associated io error.
+    /// For kind TimeError return associated time error.
     pub fn time_err(self) -> Option<std::time::SystemTimeError> {
         match self.repr {
             ErrorRepr::TimeError(e) => Some(e),
@@ -339,7 +395,7 @@ impl Error {
         }
     }
 
-    /// For kind MemoryLayoutError return associated io error.
+    /// For kind MemoryLayoutError return associated memory layout error.
     pub fn layout_err(self) -> Option<std::alloc::LayoutErr> {
         match self.repr {
             ErrorRepr::MemoryLayoutError(e) => Some(e),
@@ -381,7 +437,6 @@ enum ErrorRepr {
 #[cfg(test)]
 mod tests {
 
-
     use super::*;
     use std::path::Path;
     use std::io::{BufRead, BufReader};
@@ -389,6 +444,7 @@ mod tests {
     use std::thread;
     use std::sync::{Once, MutexGuard, atomic::AtomicU64, atomic::Ordering};
     use std::mem::MaybeUninit;
+    use std::collections::HashMap;
 
 
     const LOG_DIR: &str = "/tmp/AsyncLoggerNBTest_45870201463983";
@@ -438,13 +494,13 @@ mod tests {
     }
 
 
-    fn spawn_threads(logger: &Arc<AsyncLoggerNB>, test_strings: &[&str], cnt: usize, flush_cnt: usize) {
+    fn spawn_threads<T: Send + Sync + Clone + Copy + 'static>(logger: &Arc<AsyncLoggerNB<T>>, test_strings: &[&'static [T]], cnt: usize, flush_cnt: usize) {
 
         let mut handles = vec![];
 
         for i in 0..test_strings.len() {
 
-            let s = String::from(test_strings[i]);
+            let s = test_strings[i];
 
             let logger_c = logger.clone();
 
@@ -452,17 +508,17 @@ mod tests {
 
                 for i in 1..cnt+1 {
                     if i & 0x1 == 0 {
-                        logger_c.write_slice(s.as_bytes()).unwrap();
+                        logger_c.write_slice(&s).unwrap();
                     } else {
-                        match logger_c.reserve_bytes(s.as_bytes().len()) {
+                        match logger_c.reserve_slice(s.len()) {
                             Ok(mut bytes) => {
                                 let dst = &mut bytes;
-                                dst.copy_from_slice(s.as_bytes());
+                                dst.copy_from_slice(&s);
                                 drop(bytes);
                             },
                             Err(e) => {
                                 if e.kind() == ErrorKind::RequestedSizeIsTooLong {
-                                    logger_c.write_slice(s.as_bytes()).unwrap();
+                                    logger_c.write_slice(&s).unwrap();
                                 } else {
                                     panic!("Unexpected error: {:?}", e);
                                 }
@@ -484,6 +540,9 @@ mod tests {
         }
     }
 
+    ///
+    /// tests for u8 slices
+    ///
 
     #[test]
     fn test_async_logger_single_thread() {
@@ -492,7 +551,7 @@ mod tests {
 
         let writer = FileWriter::new(LOG_DIR).expect("Failed to create file writer");
 
-        let writer_obj: Box<dyn Writer> = Box::new(writer);
+        let writer_obj: Box<dyn Writer<u8>> = Box::new(writer);
 
         let buf_sz = 64;
         
@@ -534,11 +593,11 @@ mod tests {
     }
 
 
-    fn run_threaded_test(test_strings: &[&str], buf_sz: usize, iter_cnt: usize, flush_cnt: usize) {
+    fn run_threaded_test(test_strings: &'static [&[u8]], buf_sz: usize, iter_cnt: usize, flush_cnt: usize) {
 
         let writer = FileWriter::new(LOG_DIR).expect("Failed to create file writer");
 
-        let writer_obj: Box<dyn Writer> = Box::new(writer);
+        let writer_obj: Box<dyn Writer<u8>> = Box::new(writer);
 
         let logger = Arc::new(AsyncLoggerNB::new(writer_obj, buf_sz).expect("Failed to create new async logger"));
 
@@ -557,7 +616,7 @@ mod tests {
 
         let mut test_strings_hm = std::collections::HashMap::new();
 
-        for x in test_strings.iter() { test_strings_hm.insert(String::from(*x), 0); };
+        for x in test_strings.iter() { test_strings_hm.insert(std::str::from_utf8(*x).unwrap().to_owned(), 0); };
 
         loop {
 
@@ -584,24 +643,24 @@ mod tests {
 
         let _guard = prepare();
 
-        let test_strings = [
-            "aAaAaA AaAa 0\n",
-            "bBbBbB BbBbB 1\n",
-            "CcCcCcC cCcCcC 2\n",
-            "DdDdD dDDDdDdDd 3\n",
-            "eEeEeEe eEeEeEe E 4\n",
-            "FfFf FfFf FfFfFfFf 5\n",
-            "gGgGg GgGgG gGgGgGg 6\n",
-            "HhHhHhHhHhH hHhHhHhHh 7\n",
-            "IiIiIiI IiIiIiI iIiIiI 8\n",
-            "jJjJ jJjJjJ jJjJjJjJjjJ 9\n",
+        static TEST_STRINGS: [&[u8]; 10] = [
+            b"aAaAaA AaAa 0\n",
+            b"bBbBbB BbBbB 1\n",
+            b"CcCcCcC cCcCcC 2\n",
+            b"DdDdD dDDDdDdDd 3\n",
+            b"eEeEeEe eEeEeEe E 4\n",
+            b"FfFf FfFf FfFfFfFf 5\n",
+            b"gGgGg GgGgG gGgGgGg 6\n",
+            b"HhHhHhHhHhH hHhHhHhHh 7\n",
+            b"IiIiIiI IiIiIiI iIiIiI 8\n",
+            b"jJjJ jJjJjJ jJjJjJjJjjJ 9\n",
         ];
 
         let buf_sz = 64;
 
         let iter_cnt = 1000;
         
-        run_threaded_test(&test_strings, buf_sz, iter_cnt, iter_cnt + 1);
+        run_threaded_test(&TEST_STRINGS, buf_sz, iter_cnt, iter_cnt + 1);
       
         cleanup();
     }
@@ -612,24 +671,24 @@ mod tests {
 
         let _guard = prepare();
 
-        let test_strings = [
-            "aAaAaA AaAa 0\n",
-            "bBbBbB BbBbB 1\n",
-            "CcCcCcC cCcCcC 2\n",
-            "DdDdD dDDDdDdDd 3\n",
-            "eEeEeEe eEeEeEe E 4 eEeEeEe eEeEeEe E 4 eEeEeEe eEeEeEe E 4 eEeEeEe eEeEeEe E 4\n",
-            "FfFf FfFf FfFfFfFf 5\n",
-            "gGgGg GgGgG gGgGgGg 6\n",
-            "HhHhHhHhHhH hHhHhHhHh 7\n",
-            "IiIiIiI IiIiIiI iIiIiI 8\n",
-            "jJjJ jJjJjJ jJjJjJjJjjJ 9 jJjJ jJjJjJ jJjJjJjJjjJ 9 jJjJ jJjJjJ jJjJjJjJjjJ 9\n",
+        static TEST_STRINGS: [&[u8]; 10] = [
+            b"aAaAaA AaAa 0\n",
+            b"bBbBbB BbBbB 1\n",
+            b"CcCcCcC cCcCcC 2\n",
+            b"DdDdD dDDDdDdDd 3\n",
+            b"eEeEeEe eEeEeEe E 4 eEeEeEe eEeEeEe E 4 eEeEeEe eEeEeEe E 4 eEeEeEe eEeEeEe E 4\n",
+            b"FfFf FfFf FfFfFfFf 5\n",
+            b"gGgGg GgGgG gGgGgGg 6\n",
+            b"HhHhHhHhHhH hHhHhHhHh 7\n",
+            b"IiIiIiI IiIiIiI iIiIiI 8\n",
+            b"jJjJ jJjJjJ jJjJjJjJjjJ 9 jJjJ jJjJjJ jJjJjJjJjjJ 9 jJjJ jJjJjJ jJjJjJjJjjJ 9\n",
         ];
 
         let buf_sz = 64;
 
         let iter_cnt = 1000;
 
-        run_threaded_test(&test_strings, buf_sz, iter_cnt, iter_cnt + 1);
+        run_threaded_test(&TEST_STRINGS, buf_sz, iter_cnt, iter_cnt + 1);
 
         cleanup();
     }
@@ -639,24 +698,24 @@ mod tests {
 
         let _guard = prepare();
 
-        let test_strings = [
-            "aAaAaA AaAa 0\n",
-            "bBbBbB BbBbB 1\n",
-            "CcCcCcC cCcCcC 2\n",
-            "DdDdD dDDDdDdDd 3\n",
-            "eEeEeEe eEeEeEe E 4\n",
-            "FfFf FfFf FfFfFfFf 5\n",
-            "gGgGg GgGgG gGgGgGg 6\n",
-            "HhHhHhHhHhH hHhHhHhHh 7\n",
-            "IiIiIiI IiIiIiI iIiIiI 8\n",
-            "jJjJ jJjJjJ jJjJjJjJjjJ 9\n",
+        static TEST_STRINGS: [&[u8]; 10] = [
+            b"aAaAaA AaAa 0\n",
+            b"bBbBbB BbBbB 1\n",
+            b"CcCcCcC cCcCcC 2\n",
+            b"DdDdD dDDDdDdDd 3\n",
+            b"eEeEeEe eEeEeEe E 4\n",
+            b"FfFf FfFf FfFfFfFf 5\n",
+            b"gGgGg GgGgG gGgGgGg 6\n",
+            b"HhHhHhHhHhH hHhHhHhHh 7\n",
+            b"IiIiIiI IiIiIiI iIiIiI 8\n",
+            b"jJjJ jJjJjJ jJjJjJjJjjJ 9\n",
         ];
 
         let buf_sz = 64;
 
         let iter_cnt = 1000;
         
-        run_threaded_test(&test_strings, buf_sz, iter_cnt, iter_cnt / 20);
+        run_threaded_test(&TEST_STRINGS, buf_sz, iter_cnt, iter_cnt / 20);
       
         cleanup();
     }
@@ -666,9 +725,9 @@ mod tests {
         slice_cnt: Arc<AtomicU64>,
     }
 
-    impl Writer for WriterTest {
+    impl<T: Send + Clone + 'static> Writer<T> for WriterTest {
 
-        fn process_slice(&mut self, _slice: &[u8]) {
+        fn process_slice(&mut self, _slice: &[T]) {
             self.slice_cnt.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -677,10 +736,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_flush2() {
-
-        let write_line = "abc";
+    fn test_flush2<T: Send + Clone + Copy + 'static>(write_line: &[T]) {
 
         let buf_sz = 1024;
         let flush_cnt = Arc::new(AtomicU64::new(0));
@@ -691,16 +747,16 @@ mod tests {
             slice_cnt: slice_cnt.clone(),
         };
 
-        let writer_obj: Box<dyn Writer> = Box::new(writer);
+        let writer_obj: Box<dyn Writer<T>> = Box::new(writer);
 
         let logger = Arc::new(AsyncLoggerNB::new(writer_obj, buf_sz).expect("Failed to create new async logger"));
 
-        logger.write_slice(write_line.as_bytes()).unwrap();
-        logger.write_slice(write_line.as_bytes()).unwrap();
+        logger.write_slice(write_line).unwrap();
+        logger.write_slice(write_line).unwrap();
         logger.flush();
 
-        logger.write_slice(write_line.as_bytes()).unwrap();
-        logger.write_slice(write_line.as_bytes()).unwrap();
+        logger.write_slice(write_line).unwrap();
+        logger.write_slice(write_line).unwrap();
         logger.flush();
 
         match Arc::try_unwrap(logger) {
@@ -714,12 +770,22 @@ mod tests {
         assert!(2 <= slice_cnt && 4 >= slice_cnt, "Slice count has unexpected value {}", slice_cnt);
     }
 
+    #[test]
+    fn test_flush2_u8() {
+        let write_line: &[u8] = b"abc";
+        test_flush2(write_line);
+    }
+
+    ///
+    /// Heavy concurrency test
+    ///
+
     struct StubWriter {
         counters: [u64; 4],
         lengths: [usize; 4],
     }
 
-    impl Writer for StubWriter {
+    impl Writer<u8> for StubWriter {
         fn process_slice(&mut self, slice: &[u8]) {
             let mut p = 0;
             while p<slice.len() {
@@ -743,11 +809,11 @@ mod tests {
     #[test]
     fn heavy_concurrency_test() {
 
-        let test_strings = [
-            "1[INFO module_x]: testing message, thread #",
-            "2[INFO module_y]: testing message for thread #",
-            "3[INFO module_z]: another one message for thread #",
-            "4[INFO module_o]: a long long long long long long long long long long long long message for therad #",
+        let test_strings: &[&[u8]] = &[
+            b"1[INFO module_x]: testing message, thread #",
+            b"2[INFO module_y]: testing message for thread #",
+            b"3[INFO module_z]: another one message for thread #",
+            b"4[INFO module_o]: a long long long long long long long long long long long long message for therad #",
         ];
 
         let lengths = [
@@ -761,7 +827,7 @@ mod tests {
 
         let iter_cnt = 10000000;
 
-        let writer_obj: Box<dyn Writer> = Box::new(StubWriter {counters: [0u64;4], lengths});
+        let writer_obj: Box<dyn Writer<u8>> = Box::new(StubWriter {counters: [0u64;4], lengths});
 
         let logger = Arc::new(AsyncLoggerNB::new(writer_obj, buf_sz).expect("Failed to create new async logger"));
 
@@ -775,5 +841,211 @@ mod tests {
             Ok(logger) => logger.terminate(),
             Err(_) => panic!("Failed to terminate logger because it is still used"),
         };
+    }
+
+
+    ///
+    /// tests for u32 and u64 and str slices
+    ///
+
+    #[test]
+    fn test_flush2_u64() {
+        static WRITE_LINE: [u64; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        test_flush2(&WRITE_LINE);
+    }
+    struct IntWriter<T> {
+        pub counters: Arc<HashMap<T, AtomicU64>>,
+        pub lengths: HashMap<T, usize>,
+    }
+
+    impl<T: Clone + Sync + Send + Copy + 'static + Eq + std::hash::Hash> Writer<T> for IntWriter<T> {
+        fn process_slice(&mut self, slice: &[T]) {
+            let mut p = 0;
+            while p<slice.len() {
+                let l = slice[p];
+                (*self.counters).get(&l).unwrap().fetch_add(1, Ordering::Relaxed);
+                p += self.lengths.get(&l).unwrap();
+            }
+        }
+
+        fn flush(&mut self) { }
+    }
+
+
+    fn test_async_logger_param<T: Sync + Clone + Copy + Send + 'static + Eq + std::hash::Hash>(test_strings: &[&'static [T]]) {
+
+        let mut lengths = HashMap::new();
+        for i in 0..4 {
+            lengths.insert(test_strings[i][0], test_strings[i].len());
+        }
+
+        let buf_sz = 1024;
+
+        let iter_cnt = 10000;
+
+        let mut counters = HashMap::new();
+
+        for i in 0..4 {
+            counters.insert(test_strings[i][0], AtomicU64::new(0));
+        }
+
+        let counters = Arc::new(counters);
+
+        let writer_obj: Box<dyn Writer<T>> = Box::new(IntWriter {counters: counters.clone(), lengths});
+
+        let logger = Arc::new(AsyncLoggerNB::new(writer_obj, buf_sz).expect("Failed to create new async logger"));
+
+        for _ in 1..10 {
+            spawn_threads(&logger, test_strings, iter_cnt, iter_cnt/100);
+        }
+
+        match Arc::try_unwrap(logger) {
+            Ok(logger) => logger.terminate(),
+            Err(_) => panic!("Failed to terminate logger because it is still used"),
+        };
+    }
+
+    #[test]
+    fn test_async_logger_u32() {
+        static TEST_STRINGS: &[&[u32]] = &[
+            &[1, 502, 504, 5, 6, 101, 102, 103, 65536, 1000000000],
+            &[2, 7, 8, 9, 10, 11, 12, 13, 14, std::u32::MAX-2, 60, 61, 62, 63, 64, 65],
+            &[3, std::u32::MAX-3, 16, 17, 18, std::u32::MAX-3, 20],
+            &[4, 21, 22, 23, 24, 25, std::u32::MAX-4],
+        ];
+
+        test_async_logger_param(TEST_STRINGS);
+    }
+
+
+    #[test]
+    fn test_async_logger_u64() {
+        static TEST_STRINGS: &[&[u64]] = &[
+            &[1, 502, 504, 5, 6, 101, 102, 103, 65536, 5000000000],
+            &[2, 7, 8, 9, 10, 11, 12, 13, 14, std::u64::MAX-2, 60, 61, 62, 63, 64, 65],
+            &[3, std::u64::MAX-3, 16, 17, 18, std::u64::MAX-3, 20],
+            &[4, 21, 22, 23, 24, 25, std::u64::MAX-4],
+        ];
+
+        test_async_logger_param(TEST_STRINGS);
+    }
+
+    #[test]
+    fn test_async_logger_str() {
+        static TEST_STRINGS: &[&[&str]] = &[
+            &["1", "test"],
+            &["2",],
+            &["3", "test 3", "test test 3", "test 3 tst", ""],
+            &["4", "verdurenoj", "propergertulopus"],
+        ];
+
+        test_async_logger_param(TEST_STRINGS);
+    }
+
+    ///
+    /// Writing boxed strings
+    /// 
+    struct StringWriter {
+        pub counters: Arc<HashMap<String, AtomicU64>>,
+    }
+
+    impl Writer<Box<String>> for StringWriter {
+        fn process_slice(&mut self, slice: &[Box<String>]) {
+            let mut p = 0;
+            while p<slice.len() {
+                let l: &String = &(slice[p]);
+                match (*self.counters).get(l) {
+                    Some(c) => { c.fetch_add(1, Ordering::Relaxed); },
+                    None => panic!("wrong val {}, {}, {:?}", l, p, slice)
+                };
+                p += 1;
+            }
+        }
+
+        fn flush(&mut self) { }
+    }
+
+    fn write_complete_slice_boxed(logger_c: &Arc<AsyncLoggerNB<Box<String>>>, s: &[&str]) {
+
+        for j in 0..s.len() {
+            logger_c.write_value(Box::new(s[j].to_owned())).unwrap();
+        }
+    }
+
+    fn spawn_threads_string(logger: &Arc<AsyncLoggerNB<Box<String>>>, test_strings: &'static [&'static [&str]], cnt: usize, flush_cnt: usize) {
+
+        let mut handles = vec![];
+
+        for i in 0..test_strings.len() {
+
+            let s = test_strings[i];
+
+            let logger_c = logger.clone();
+
+            let handle = thread::spawn(move || {
+
+                for l in 1..cnt+1 {
+
+                    write_complete_slice_boxed(&logger_c, s);
+
+                    if l % flush_cnt == 0 {
+                        logger_c.flush();
+                    }
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Failed on thread join");
+        }
+    }
+
+
+    fn test_async_logger_boxed(test_strings: &'static [&'static [&str]]) {
+
+        let buf_sz = 1024;
+
+        let iter_cnt = 10000;
+
+        let mut counters = HashMap::new();
+
+        for i in 0..test_strings.len() {
+            for j in 0..test_strings[i].len() {
+                counters.insert(String::from(test_strings[i][j]), AtomicU64::new(0));
+            }
+        }
+
+        let counters = Arc::new(counters);
+
+        let writer_obj: Box<dyn Writer<Box<String>>> = Box::new(StringWriter {counters: counters.clone()});
+
+        let logger = Arc::new(AsyncLoggerNB::new(writer_obj, buf_sz).expect("Failed to create new async logger"));
+
+        for _ in 1..10+1 {
+            spawn_threads_string(&logger, test_strings, iter_cnt, iter_cnt/100);
+        }
+
+        match Arc::try_unwrap(logger) {
+            Ok(logger) => logger.terminate(),
+            Err(_) => panic!("Failed to terminate logger because it is still used"),
+        };
+
+        for (k,v) in counters.iter() {
+            assert_eq!(iter_cnt*10, v.load(Ordering::Relaxed) as usize, "Counter for value {} doesn't match", k);
+        }
+    }
+
+    #[test]
+    fn test_async_logger_box() {
+        static TEST_STRINGS: &[&[&str]] = &[
+            &["line 1", "test"],
+            &["line 2",],
+            &["line 3", "test 3", "test test 3", "test 3 tst", ""],
+            &["line 4", "verdurenoj", "propergertulopus"],
+        ];
+
+        test_async_logger_boxed(TEST_STRINGS);
     }
 }

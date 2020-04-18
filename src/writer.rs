@@ -49,7 +49,7 @@ impl FileWriter {
 }
 
 
-impl Writer for FileWriter {
+impl Writer<u8> for FileWriter {
 
     fn process_slice(&mut self, slice: &[u8]) {
 
@@ -63,6 +63,21 @@ impl Writer for FileWriter {
 }
 
 
+impl Writer<Box<String>> for FileWriter {
+
+    fn process_slice(&mut self, slice: &[Box<String>]) {
+
+        for item in slice {
+            let _ret = self.f.write_all(item.as_bytes());
+        }
+    }
+
+    fn flush(&mut self) {
+
+        let _ret = self.f.flush();
+    }
+}
+
 
 /// Writer thread.
 pub struct ThreadedWriter {
@@ -71,17 +86,17 @@ pub struct ThreadedWriter {
 }
 
 
-impl<'a> ThreadedWriter {
+impl ThreadedWriter {
 
     /// Create a new instance: spawn a thread, pass a `writer` there, and do writes of log messages
     /// using the `writer`.
-    pub fn new(writer: Arc<Mutex<Box<dyn Writer>>>, db: &DoubleBuf) -> ThreadedWriter {
+    pub fn new<T: Send + 'static>(writer: Arc<Mutex<Box<dyn Writer<T>>>>, db: &DoubleBuf<T>) -> ThreadedWriter {
 
         let terminate = Arc::new(AtomicBool::new(false));
 
         let terminate2 = terminate.clone();
 
-        let db2 = db.clone();
+        let db2 = (*db).clone();
 
         let writer_thread = std::thread::spawn(move || {
 
@@ -107,7 +122,7 @@ impl<'a> ThreadedWriter {
 
 
     /// enters the loop of reading from buffer and writing to a file
-    fn write_log_loop(writer: Arc<Mutex<Box<dyn Writer>>>, buf: DoubleBuf, terminate: Arc<AtomicBool>) {
+    fn write_log_loop<T: Send + 'static>(writer: Arc<Mutex<Box<dyn Writer<T>>>>, buf: DoubleBuf<T>, terminate: Arc<AtomicBool>) {
 
         let mut terminated_cnt = 0;
 
@@ -115,11 +130,16 @@ impl<'a> ThreadedWriter {
 
         loop {
 
-            let slice = buf.reserve_for_reaed(buf_id);
+            let slice: &mut [T] = buf.reserve_for_reaed(buf_id);
 
             let mut guard = writer.lock().unwrap();
 
             guard.process_slice(slice);
+
+            let ptr = slice.as_mut_ptr();
+            for i in 0..slice.len() {
+                unsafe { std::ptr::drop_in_place(ptr.offset(i as isize)) }
+            }
 
             if terminate.load(Ordering::Relaxed) {
 
@@ -132,7 +152,7 @@ impl<'a> ThreadedWriter {
                     guard.flush();
                     break;
                 }
-                
+ 
             } else {
 
                 buf.set_buf_appendable(buf_id);

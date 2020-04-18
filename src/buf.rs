@@ -24,37 +24,39 @@ struct CacheAligned<T> (T);
 /// Shared buffer which allows reserving mutable areas of memory concurrently.
 /// # Safety
 /// This structure is internal, and can't be considered safe by itself.
-pub struct Buf {
+pub struct Buf<T> {
     acquire_size:   CacheAligned<AtomicUsize>,
     done_size:      CacheAligned<AtomicUsize>,
     used_size:      AtomicUsize,
-    ptr:            *mut u8,
+    ptr:            *mut T,
     size:           usize,
 }
 
-impl Buf {
+impl<T> Buf<T> {
 
-    /// Create a new instance with allocation of `size` bytes. The memory is never deallocated
+    /// Create a new instance with allocation of `size` items. The memory is never deallocated
     /// after the allocation.
     /// `size` must be > 0 and <= std::isize::MAX.
     /// # Errors
     /// Returns `Err` if allocation has failed.
-    fn new(size: usize) -> Result<Buf, Error> {
+    fn new(size: usize) -> Result<Buf<T>, Error> {
 
-        if size > (std::isize::MAX as usize) || size < 1 {
+        let dt_sz = std::mem::size_of::<T>();
+
+        if size * dt_sz > (std::isize::MAX as usize) || size * dt_sz < 1 {
 
             return Err(Error::new(ErrorKind::IncorrectBufferSize, ErrorRepr::Simple));
         }
 
-        let ptr: *mut u8;
+        let ptr: *mut T;
 
         unsafe {
 
-            let align = std::mem::align_of::<u8>();
+            let align = std::mem::align_of::<T>();
             ptr = std::alloc::alloc(
-                std::alloc::Layout::from_size_align(size, align)
+                std::alloc::Layout::from_size_align(size * dt_sz, align)
                 .map_err(|e| { Error::new(ErrorKind::MemoryLayoutError, ErrorRepr::MemoryLayoutError(e)) })?
-            );
+            ) as *mut T;
         }
 
         if ptr.is_null() {
@@ -87,7 +89,7 @@ impl Buf {
 
 
     /// Returns tuple of `bool` and `bool`: "data is written", and "notify writer"
-    fn write_slice(&self, slice: &[u8]) -> (bool, bool) {
+    fn write_slice(&self, slice: &[T]) -> (bool, bool) {
 
         let reserve_size = slice.len();
 
@@ -150,8 +152,8 @@ impl Buf {
         }
     }
 
-    /// Returns Bytes instance, and "notify writer"
-    fn reserve_bytes(&self, reserve_size: usize, relaxed: bool) -> (Option<&mut [u8]>, bool) {
+    /// Returns Slice instance, and "notify writer"
+    fn reserve_slice(&self, reserve_size: usize, relaxed: bool) -> (Option<&mut [T]>, bool) {
 
         if reserve_size == 0 {
 
@@ -222,6 +224,7 @@ impl Buf {
         }
     }
 
+
     #[inline]
     fn inc_done_size(&self, reserve_size: usize) -> usize {
         return self.done_size.0.fetch_add(reserve_size, Ordering::Relaxed) + reserve_size;
@@ -267,7 +270,7 @@ impl Buf {
     }
 
     /// Returns buffer for reading.
-    fn acquire_for_read(&self) -> &[u8] {
+    fn acquire_for_read(&self) -> &mut [T] {
 
         let total_written = self.used_size.load(Ordering::Relaxed);
 
@@ -275,7 +278,7 @@ impl Buf {
 
         unsafe {
 
-            ret = std::slice::from_raw_parts(self.ptr, total_written);
+            ret = std::slice::from_raw_parts_mut(self.ptr, total_written);
         };
 
         ret
@@ -283,22 +286,22 @@ impl Buf {
 }
 
 
-impl Drop for Buf {
+impl<T> Drop for Buf<T> {
 
     fn drop(&mut self) {
 
-        let align = std::mem::align_of::<u8>();
+        let align = std::mem::align_of::<T>();
 
         unsafe {
 
-            std::alloc::dealloc(self.ptr, std::alloc::Layout::from_size_align(self.size, align).unwrap());
+            std::alloc::dealloc(self.ptr as *mut u8, std::alloc::Layout::from_size_align(self.size, align).unwrap());
         }
     }
 }
 
 
-unsafe impl Sync for Buf {}
-unsafe impl Send for Buf {}
+unsafe impl<T> Sync for Buf<T> {}
+unsafe impl<T> Send for Buf<T> {}
 
 /// Metrics values.
 #[derive(Debug)]
@@ -316,10 +319,8 @@ struct MetricsInternal {
 
 
 /// Doubled Buf instances (flip-flop buffer)
-#[derive(Clone)]
-pub struct DoubleBuf {
-    bufs: Arc<Vec<Buf>>,
-
+pub struct DoubleBuf<T> {
+    bufs: Arc<Vec<Buf<T>>>,
     #[cfg(feature = "metrics")]
     metrics: Arc<MetricsInternal>,
     buf_state: Arc<(Mutex<[BufState; 2]>, Condvar, Condvar)>,
@@ -327,37 +328,29 @@ pub struct DoubleBuf {
 }
 
 
-impl DoubleBuf {
+impl<T> DoubleBuf<T> {
 
 
     /// Create an instance of buffer pair, each of size `sz`.
-    pub fn new(sz: usize) -> Result<DoubleBuf, Error> {
+    pub fn new(sz: usize) -> Result<DoubleBuf<T>, Error> {
 
-        let bufs = Arc::new(vec![Buf::new(sz)?, Buf::new(sz)?]);
+        let bufs = Arc::new(vec![Buf::<T>::new(sz)?, Buf::new(sz)?]);
 
         let buf_state = Arc::new((Mutex::new([BufState::Appendable, BufState::Appendable]), Condvar::new(), Condvar::new()));
 
-        #[cfg(feature = "metrics")] {
-            let metrics = Arc::new(MetricsInternal {
-                wait_time: CacheAligned(AtomicU64::new(0)),
-                wait_count: CacheAligned(AtomicU64::new(0)),
-            });
+        #[cfg(feature = "metrics")]
+        let metrics = Arc::new(MetricsInternal {
+            wait_time: CacheAligned(AtomicU64::new(0)),
+            wait_count: CacheAligned(AtomicU64::new(0)),
+        });
 
-            Ok(DoubleBuf {
-                bufs,
-                metrics,
-                buf_state,
-                size: sz,
-            })
-        }
-
-        #[cfg(not(feature = "metrics"))] {
-            Ok(DoubleBuf {
-                bufs,
-                buf_state,
-                size: sz,
-            })
-        }
+        Ok(DoubleBuf {
+            bufs,
+            #[cfg(feature = "metrics")]
+            metrics,
+            buf_state,
+            size: sz,
+        })
     }
 
     /// return number of buffers
@@ -367,7 +360,7 @@ impl DoubleBuf {
         self.bufs.len()
     }
 
-    fn try_write(&self, buf_id: usize, slice: &[u8]) -> bool {
+    fn try_write(&self, buf_id: usize, slice: &[T]) -> bool {
 
         let (is_written, notify_writer) = self.bufs[buf_id].write_slice(slice);
 
@@ -386,9 +379,9 @@ impl DoubleBuf {
         return is_written;
     }
 
-    fn try_reserve(&self, buf_id: usize, reserve_size: usize, relaxed: bool) -> Option<Bytes> {
+    fn try_reserve(&self, buf_id: usize, reserve_size: usize, relaxed: bool) -> Option<Slice<T>> {
 
-        match self.bufs[buf_id].reserve_bytes(reserve_size, relaxed) {
+        match self.bufs[buf_id].reserve_slice(reserve_size, relaxed) {
             (None, notify) => {
                 if notify {
                     self.set_buf_readable(buf_id);
@@ -400,7 +393,7 @@ impl DoubleBuf {
                     *v.borrow_mut() = buf_id; 
                 });
 
-                return Some(Bytes {
+                return Some(Slice {
                     slice,
                     parent: self,
                     buf_id,
@@ -411,7 +404,7 @@ impl DoubleBuf {
 
     /// Write data.
     /// `Err` is retured if buffer is terminated
-    pub fn write_slice(&self, slice: &[u8]) -> Result<(), ()> {
+    pub fn write_slice(&self, slice: &[T]) -> Result<(), ()> {
 
         let mut cur_buf = 0;
 
@@ -435,25 +428,18 @@ impl DoubleBuf {
 
                 if appendable > 0 {
 
-                    #[cfg(feature = "metrics")] {
-                        let now = std::time::Instant::now();
-                        std::thread::yield_now();
+                    #[cfg(feature = "metrics")]
+                    let now = std::time::Instant::now();
 
-                        if appendable > 10000 {
-                            std::thread::sleep(std::time::Duration::new(0,10_000_000));
-                            appendable = 0;
-                        }
-                        self.inc_metrics(1, std::time::Instant::now().duration_since(now).as_nanos() as u64);
+                    std::thread::yield_now();
+
+                    if appendable > 10000 {
+                        std::thread::sleep(std::time::Duration::new(0,10_000_000));
+                        appendable = 0;
                     }
 
-                    #[cfg(not(feature = "metrics"))] {
-                        std::thread::yield_now();
-
-                        if appendable > 10000 {
-                            std::thread::sleep(std::time::Duration::new(0,10_000_000));
-                            appendable = 0;
-                        }
-                    }
+                    #[cfg(feature = "metrics")]
+                    self.inc_metrics(1, std::time::Instant::now().duration_since(now).as_nanos() as u64);
                 }
 
                 let (buf_id, state) = self.wait_for(BufState::Appendable as u32 | BufState::Terminated as u32);
@@ -470,9 +456,8 @@ impl DoubleBuf {
         }
     }
 
-
     /// Reserve slice for write.
-    pub fn reserve_bytes(&self, reserve_size: usize, relaxed: bool) -> Result<Bytes, Error> {
+    pub fn reserve_slice(&self, reserve_size: usize, relaxed: bool) -> Result<Slice<T>, Error> {
 
         let mut cur_buf = 0;
 
@@ -484,37 +469,30 @@ impl DoubleBuf {
 
         loop {
 
-            if let Some(bytes) = self.try_reserve(cur_buf, reserve_size, relaxed) {
+            if let Some(slice) = self.try_reserve(cur_buf, reserve_size, relaxed) {
 
-                return Ok(bytes);
+                return Ok(slice);
 
-            } else if let Some(bytes) = self.try_reserve(1 - cur_buf, reserve_size, relaxed) {
+            } else if let Some(slice) = self.try_reserve(1 - cur_buf, reserve_size, relaxed) {
 
-                return Ok(bytes);
+                return Ok(slice);
 
             } else {
 
                 if appendable > 0 {
 
-                    #[cfg(feature = "metrics")] {
-                        let now = std::time::Instant::now();
-                        std::thread::yield_now();
+                    #[cfg(feature = "metrics")] 
+                    let now = std::time::Instant::now();
 
-                        if appendable > 10000 {
-                            std::thread::sleep(std::time::Duration::new(0,10_000_000));
-                            appendable = 0;
-                        }
-                        self.inc_metrics(1, std::time::Instant::now().duration_since(now).as_nanos() as u64);
+                    std::thread::yield_now();
+
+                    if appendable > 10000 {
+                        std::thread::sleep(std::time::Duration::new(0,10_000_000));
+                        appendable = 0;
                     }
 
-                    #[cfg(not(feature = "metrics"))] {
-                        std::thread::yield_now();
-
-                        if appendable > 10000 {
-                            std::thread::sleep(std::time::Duration::new(0,10_000_000));
-                            appendable = 0;
-                        }
-                    }
+                    #[cfg(feature = "metrics")] 
+                    self.inc_metrics(1, std::time::Instant::now().duration_since(now).as_nanos() as u64);
                 }
 
                 let (buf_id, state) = self.wait_for(BufState::Appendable as u32 | BufState::Terminated as u32);
@@ -533,7 +511,7 @@ impl DoubleBuf {
 
     /// Return buffer slice for buffer `buf_id` when buffer is ready to be processed by the writer.
     /// If the buffer is not full the method blocks until buffer is ready for processing.
-    pub fn reserve_for_reaed(&self, buf_id: usize) -> &[u8] {
+    pub fn reserve_for_reaed(&self, buf_id: usize) -> &mut [T] {
 
         self.wait_for_buf(BufState::Readable as u32, buf_id);
 
@@ -549,7 +527,7 @@ impl DoubleBuf {
 
         let mut cur_state = lock.lock().unwrap();
 
-        let cvar = DoubleBuf::determine_cvar(state, cvar_a, cvar_r);
+        let cvar = DoubleBuf::<T>::determine_cvar(state, cvar_a, cvar_r);
 
         loop {
 
@@ -606,7 +584,7 @@ impl DoubleBuf {
 
         let mut cur_state = lock.lock().unwrap();
 
-        let cvar = DoubleBuf::determine_cvar(state, cvar_a, cvar_r);
+        let cvar = DoubleBuf::<T>::determine_cvar(state, cvar_a, cvar_r);
 
         loop {
 
@@ -728,6 +706,19 @@ impl DoubleBuf {
 }
 
 
+impl<T> Clone for DoubleBuf<T> {
+    fn clone(&self) -> Self {
+        DoubleBuf {
+            bufs: self.bufs.clone(),
+            #[cfg(feature = "metrics")]
+            metrics: self.metrics.clone(),
+            buf_state: self.buf_state.clone(),
+            size: self.size,
+        }
+    }
+}
+
+
 use std::ops::{Deref, DerefMut};
 
 
@@ -739,31 +730,31 @@ enum BufState {
     Terminated = 0b100,
 }
 
-/// Wrapper for writable slice of [u8].
-pub struct Bytes<'a> {
-    slice:  &'a mut [u8],
-    parent: &'a DoubleBuf,
+/// Wrapper for writable slice of [T].
+pub struct Slice<'a, T> {
+    slice:  &'a mut [T],
+    parent: &'a DoubleBuf<T>,
     buf_id: usize,
 }
 
 
-impl<'a> Deref for Bytes<'a> {
+impl<'a, T> Deref for Slice<'a, T> {
 
-    type Target = [u8];
+    type Target = [T];
 
     fn deref(&self) -> &Self::Target {
         self.slice
     }
 }
 
-impl<'a> DerefMut for Bytes<'a> {
+impl<'a, T> DerefMut for Slice<'a, T> {
 
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.slice
     }
 }
 
-impl<'a> Drop for Bytes<'a> {
+impl<'a, T> Drop for Slice<'a, T> {
 
     fn drop(&mut self) {
 
@@ -784,16 +775,25 @@ mod tests {
 
     #[test]
     fn too_big_size() {
-        if let Ok(_) = Buf::new(std::isize::MAX as usize) {
+        if let Ok(_) = Buf::<u8>::new(std::isize::MAX as usize) {
+            panic!("Buf::new takes size value more than expected");
+        }
+
+        if let Ok(_) = Buf::<u32>::new((std::isize::MAX as usize) / std::mem::size_of::<u32>() + 1) {
             panic!("Buf::new takes size value more than expected");
         }
     }
 
     #[test]
     fn zero_size() {
-        if let Ok(_) = Buf::new(0) {
+        if let Ok(_) = Buf::<u8>::new(0) {
+            panic!("Buf::new takes zero size");
+        }
+
+        struct Tst {}
+
+        if let Ok(_) = Buf::<Tst>::new(123) {
             panic!("Buf::new takes zero size");
         }
     }
-
 }
