@@ -11,6 +11,9 @@ use super::{Writer, Error, ErrorRepr, ErrorKind};
 /// Writer to a file.
 pub struct FileWriter {
     f:  File,
+    file_size: usize,
+    log_dir: String,
+    written_size: usize,
 }
 
 
@@ -18,33 +21,67 @@ impl FileWriter {
 
     /// Creates a `FileWriter` which will write to a file located in `log_dir` directory.
     /// The file name has form `log_<unix_timestamp_seconds>.txt`.
-    pub fn new(log_dir: &str) -> Result<FileWriter, Error> {
+    /// When the file size grows beyound `file_size` bytes the file is closed and a new file is
+    /// opened.
+    ///
+    /// # Errors
+    ///
+    /// `Err` is returend if opening of log file was not successful.
+    pub fn new(log_dir: &str, file_size: usize) -> Result<FileWriter, Error> {
+
+        let f = FileWriter::open_log_file(log_dir)?;
+
+        Ok(FileWriter {
+            f,
+            file_size,
+            log_dir: log_dir.to_owned(),
+            written_size: 0,
+        })
+    }
+
+    fn open_log_file(log_dir: &str) -> Result<File, Error> {
 
         let epoch_secs = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|e| { Error::new(ErrorKind::TimeError, ErrorRepr::TimeError(e)) })?
             .as_secs();
 
-        let file_name = format!("log_{}.txt", epoch_secs);
+        let mut file_name = format!("log_{}.txt", epoch_secs);
+        let mut file_path;
+        let mut index = 2;
 
-        let mut file_path = PathBuf::new();
+        loop {
+            file_path = PathBuf::new();
 
-        file_path.push(log_dir);
-        file_path.push(file_name);
+            file_path.push(log_dir);
+            file_path.push(&file_name);
+            if file_path.exists() {
+                file_name = format!("log_{}_{}.txt", epoch_secs, index);
+                index += 1;
+            } else {
+                break;
+            }
+        }
 
         let file_path = file_path
             .to_str()
             .ok_or(Error::new(ErrorKind::PathToStrConversionError, ErrorRepr::Simple))?;
 
-        let f = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .append(true)
             .create_new(true)
             .open(file_path)
-            .map_err(|e| { Error::new(ErrorKind::IoError, ErrorRepr::IoError(e)) })?;
+            .map_err(|e| { Error::new(ErrorKind::IoError, ErrorRepr::IoError(e)) })
+    }
 
-        Ok(FileWriter {
-            f,
-        })
+    fn rotate_log(&mut self) {
+        match FileWriter::open_log_file(&self.log_dir) {
+            Ok(f) => {
+                self.f = f;
+                self.written_size = 0;
+            }
+            Err(e) => eprintln!("Failed to perform log rotation: {}", e),
+        };
     }
 }
 
@@ -53,7 +90,15 @@ impl Writer<u8> for FileWriter {
 
     fn process_slice(&mut self, slice: &[u8]) {
 
-        let _ret = self.f.write_all(&slice);
+        if self.written_size > self.file_size {
+            self.rotate_log();
+        }
+
+        if let Err(e) = self.f.write_all(slice) {
+            eprintln!("Write to log failed: {}", e);
+        }
+
+        self.written_size += slice.len();
     }
 
     fn flush(&mut self) {
@@ -67,8 +112,18 @@ impl Writer<Box<String>> for FileWriter {
 
     fn process_slice(&mut self, slice: &[Box<String>]) {
 
+        if self.written_size > self.file_size {
+            self.rotate_log();
+        }
+
         for item in slice {
-            let _ret = self.f.write_all(item.as_bytes());
+            let bytes = item.as_bytes();
+
+            if let Err(e) = self.f.write_all(bytes) {
+                eprintln!("Write to log failed: {}", e);
+            }
+
+            self.written_size += bytes.len();
         }
     }
 
@@ -160,5 +215,83 @@ impl ThreadedWriter {
 
             buf_id = 1 - buf_id;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use std::path::Path;
+
+    fn prepare(log_dir: &str) {
+        if Path::new(log_dir).exists() {
+            cleanup(log_dir);
+        }
+
+        std::fs::create_dir(log_dir).expect("Failed to create test dir");
+    }
+
+    fn cleanup(log_dir: &str) {
+        std::fs::remove_dir_all(log_dir).expect("Failed to delete test dir on cleanup");
+    }
+
+    fn check_result(log_dir: &str, expected_file_size: usize) -> PathBuf {
+        let expected_file_cnt = 1;
+        let mut file_cnt = 0;
+        let mut file = None;
+        for entry in Path::new(log_dir).read_dir().expect("Failed to list files in test directory") {
+            let ent = entry.expect("Failed to get entry inside test directory");
+            let meta = ent.metadata().expect("Failed to extract log file metadata");
+            assert!(meta.is_file());
+            assert_eq!(expected_file_size, meta.len() as usize, "Unexpected log file size");
+            file_cnt += 1;
+            file = Some(ent);
+        }
+
+        assert_eq!(expected_file_cnt, file_cnt, "Expected to find just {} log file in {}", expected_file_cnt, log_dir);
+        file.expect("Log file is not found").path()
+    }
+
+    #[test]
+    fn test_rotation() {
+        let file_size = 1024;
+        let slice = "12345678".as_bytes();
+        let log_dir = "/tmp/AsyncLoggerNBTest_458702014905836";
+
+        prepare(log_dir);
+
+        let mut fw = FileWriter::new(log_dir, file_size).expect("Failed to create file writer");
+
+        for _ in 0..file_size / slice.len() {
+            fw.process_slice(slice);
+        };
+
+        Writer::<u8>::flush(&mut fw);
+
+        let file = check_result(log_dir, file_size);
+
+        fw.process_slice(slice);
+        Writer::<u8>::flush(&mut fw);
+        std::fs::remove_file(file).expect("Failed to delete log file after rotation");
+
+        for _ in 0..file_size / slice.len() {
+            fw.process_slice(slice);
+        };
+
+        Writer::<u8>::flush(&mut fw);
+
+        let file = check_result(log_dir, file_size);
+
+        fw.process_slice(slice);
+        Writer::<u8>::flush(&mut fw);
+        std::fs::remove_file(file).expect("Failed to delete log file after rotation");
+
+        fw.process_slice(slice);
+        Writer::<u8>::flush(&mut fw);
+
+        check_result(log_dir, slice.len());
+
+        cleanup(log_dir);
     }
 }

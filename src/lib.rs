@@ -26,7 +26,7 @@
 //! use async_logger::AsyncLoggerNB;
 //! use std::{thread, sync::Arc};
 //!
-//! let writer = FileWriter::new("/tmp").expect("Failed to create file writer");
+//! let writer = FileWriter::new("/tmp", 10*1024*1024).expect("Failed to create file writer");
 //!
 //! let logger = Arc::new(AsyncLoggerNB::new(Box::new(writer), 8192)
 //!     .expect("Failed to create new async logger"));
@@ -327,8 +327,8 @@ impl<T: Send + 'static> AsyncLoggerNB<T> {
     /// let logger = AsyncLoggerNB::new(Box::new(Stub {}), 8192)
     ///     .expect("Failed to create new async logger");
     ///
-    /// let stringPtr = Box::new("test message".to_owned());
-    /// logger.write_value(stringPtr).unwrap();
+    /// let string_ptr = Box::new("test message".to_owned());
+    /// logger.write_value(string_ptr).unwrap();
     ///
     /// ```
     pub fn write_value(&self, value: T) -> Result<(),()> {
@@ -549,7 +549,7 @@ mod tests {
 
         let _guard = prepare();
 
-        let writer = FileWriter::new(LOG_DIR).expect("Failed to create file writer");
+        let writer = FileWriter::new(LOG_DIR, std::usize::MAX).expect("Failed to create file writer");
 
         let writer_obj: Box<dyn Writer<u8>> = Box::new(writer);
 
@@ -595,7 +595,7 @@ mod tests {
 
     fn run_threaded_test(test_strings: &'static [&[u8]], buf_sz: usize, iter_cnt: usize, flush_cnt: usize) {
 
-        let writer = FileWriter::new(LOG_DIR).expect("Failed to create file writer");
+        let writer = FileWriter::new(LOG_DIR, std::usize::MAX).expect("Failed to create file writer");
 
         let writer_obj: Box<dyn Writer<u8>> = Box::new(writer);
 

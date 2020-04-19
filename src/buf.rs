@@ -43,7 +43,7 @@ impl<T> Buf<T> {
 
         let dt_sz = std::mem::size_of::<T>();
 
-        if size * dt_sz > (std::isize::MAX as usize) || size * dt_sz < 1 {
+        if size == 0 || dt_sz == 0 || size > (std::isize::MAX as usize) / dt_sz {
 
             return Err(Error::new(ErrorKind::IncorrectBufferSize, ErrorRepr::Simple));
         }

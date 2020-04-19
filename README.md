@@ -33,7 +33,7 @@ use async_logger::FileWriter;
 use async_logger::AsyncLoggerNB;
 use std::{thread, sync::Arc};
 
-let writer = FileWriter::new("/tmp").expect("Failed to create file writer");
+let writer = FileWriter::new("/tmp", 10*1024*1024).expect("Failed to create file writer");
 
 let logger = Arc::new(AsyncLoggerNB::new(Box::new(writer), 8192)
     .expect("Failed to create new async logger"));
