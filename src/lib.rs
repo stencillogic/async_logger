@@ -288,7 +288,7 @@ impl<T: Send + 'static> AsyncLoggerNB<T> {
     ///
     /// This function panics if some of the internal mutexes is poisoned or when writer thread panics.
     #[inline]
-    pub fn reserve_slice_relaxed(&self, reserve_size: usize) -> Result<Slice<T>,()> {
+    pub fn reserve_slice_relaxed(&self, reserve_size: usize) -> Result<Slice<T>,()>  where T: Copy {
 
         return self.buf.reserve_slice(reserve_size, true).map_err(|_| {()});
     }
