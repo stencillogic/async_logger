@@ -1,23 +1,21 @@
-//! Asynchronous logger.
-//!
-//! `AsyncLoggerNB` is implementation of asynchronous logger that allows writing arbitrary 
-//! slices or individual values to a memory buffer, and then send the buffer to a writer. 
-//!
-//! NB at the end of `AsyncLoggerNB` stands for non-blocking. Implementation allows adding messages to a buffer without locking
-//! the buffer which prevents other threads from waiting. `AsyncLoggerNB` uses pair of fixed size buffers; 
+//! `AsyncLoggerNB` is implementation of asynchronous logger/queue that allows writing arbitrary slices to a memory buffer, 
+//! and then send the buffer to a processing thread. 
+//! 
+//! `AsyncLoggerNB` uses pair of fixed size buffers; 
 //! while one buffer is being written by the multiple threads, the second is being proccessed by the
-//! single writer thread. Blocking appears when buffers change their roles.
-//! Thus, this implementation is applicable in situation of small (compared to the size of buffer) writes
-//! by multiple threads running on multiple cpu cores with high concurrency of writes.
-//!
-//! `AsyncLoggerNB` can process serialized data (stream of bytes) or custom complex data structures, references to objects.
-//!
-//! `AsyncLoggerNB` can accept any writer implementation of `Writer` trait. This package includes
-//! `FileWriter` that writes data to a file. You can create your own implementation of the `Writer`
-//! trait as well.
-//!
-//! Implementation of [log](https://docs.rs/log) facade based on this asynchronous logger is available as separate crate
-//! [async_logger_log](https://docs.rs/async_logger_log). Please refer to `async_logger_log` crate documentation for more info and examples.
+//! single "writer" thread. Writing to a buffers is lock-free operation.
+//! Blocking appears only at the moment when buffers change their roles.
+//! This makes `AsyncLoggerNB` realy fast, and at the same time allows it be bounded.
+//! It can be effectively used in mutlithreaded mutlicore environment with high level of concurrent writes 
+//! when you don't want to drop messages or run out of memory but still want to keep lock-free writes.
+//! 
+//! `AsyncLoggerNB` can process serialized data (stream of bytes) or custom complex data structures, and also references to objects.
+//! 
+//! `AsyncLoggerNB` can accept any "writer" as soon as it implements `Writer` trait. This package includes
+//! `FileWriter` that writes data to a file.
+//! 
+//! Implementation of [log](https://docs.rs/log) facade based on this crate is available as separate crate
+//! [async_logger_log](https://docs.rs/async_logger_log).
 //!
 //! # Examples
 //!
@@ -53,8 +51,8 @@
 //! };
 //! ```
 //!
-//! When you know size of data to be written in beforehand it may be more efficient to write data
-//! directly to the logger buffer. For that case `AsyncLoggerNB::reserve_slice` can be used:
+//! When the size of data to be written is known in beforehand it may be more efficient to write data
+//! directly to the underlying buffer. In this case `AsyncLoggerNB::reserve_slice` can be used:
 //!
 //! ```
 //! use async_logger::{FileWriter, AsyncLoggerNB, Writer};
@@ -88,7 +86,7 @@
 //! ```
 //!
 //! Sometimes it is more efficient to write a pointer to some existing instance of struct instead
-//! of copying the complete object. This can be achieved by moving boxed reference to an object to
+//! of copying the complete struct into buffer. This can be achieved by moving boxed reference to a struct to
 //! `AsyncLoggerNB::write_value`. See the documentation of the function 
 //! [write_value](struct.AsyncLoggerNB.html#method.write_value) for details and example.
 //!
@@ -98,25 +96,23 @@
 //! messages. Choosing too small size leads to performance degradation. And choosing too big size
 //! doesn't increase performance significantly but leads to resource waste. 
 //!
-//! 65536 bytes is typical size.
-//!
 //! ### Performance tests
 //!
-//! Tests show that this non-blocking implementation is at least not slower than comparable
-//! implementation with mutex, and can be two times faster under highly competitive load.
+//! Tests show that this lock-free implementation is at least not slower than comparable
+//! implementation with mutex, and can be at least two times faster under highly competitive load.
 //!
 //! ### Metrics
 //!
 //! `AsyncLoggerNB` collects total time spent by threads waiting for free buffer space in nanoseconds,
 //! and total count of wait events. 
 //! Metrics collection is enabled at compile time with feature `metrics`.
-//! After enabling metrics you can use `AsyncLoggerNB::get_metrics` to get the current metrics values.
+//! After enabling metrics `AsyncLoggerNB::get_metrics` can be used to get the current metrics values.
 //! Note, the metrics values can wrap around after significant amount of time of running without
 //! interruption.
 //!
 //! # Notes
 //!
-//! Attempting to get several instances of `Byte` struct at the same time in the same thread can cause deadlock.
+//! Attempt to get several instances of `Slice` struct at the same time in the same thread can cause deadlock.
 
 mod buf;
 mod writer;
