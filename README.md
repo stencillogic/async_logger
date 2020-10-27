@@ -2,10 +2,13 @@
 
 ![Rust](https://github.com/stencillogic/async_logger/workflows/Rust/badge.svg)
 
-Asynchronous logger allows writing arbitrary data to a fixed size memory buffer very fast. 
-The data from the memory buffer then can be processed in a separate thread. 
-This crate was created initially for logging purposes but also can be used as a queue anywhere.
+Asynchronous logger allows fast writing of arbitrary data to a fixed size memory buffer. 
+The data from the memory buffer then can be processed in a separate thread.
+This crate was created initially for logging purposes but also can be used as a queue anywhere else.
 See [crate documentation](https://docs.rs/async_logger/) for more info.
+
+Implementation of [log](https://docs.rs/log) facade based on this crate is available as separate crate
+[async_logger_log](https://docs.rs/async_logger_log).
 
 ## Intro
 
@@ -24,9 +27,6 @@ when you don't want to drop messages or run out of memory but still want to keep
 
 `AsyncLoggerNB` can accept any "writer" as soon as it implements `Writer` trait. This package includes
 `FileWriter` that writes data to a file.
-
-Implementation of [log](https://docs.rs/log) facade based on this crate is available as separate crate
-[async_logger_log](https://docs.rs/async_logger_log).
 
 ## Examples
 
