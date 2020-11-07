@@ -17,7 +17,7 @@ thread_local! {
 }
 
 
-#[repr(align(64))]
+#[repr(align(256))]
 struct CacheAligned<T> (T);
 
 
@@ -78,13 +78,10 @@ impl<T> Buf<T> {
 
     /// Sets used space count to zero.
     fn reset(&self) {
-
         self.used_size.store(0, Ordering::Relaxed);
         self.done_size.0.store(0, Ordering::Relaxed);
-
         compiler_fence(Ordering::SeqCst);
-
-        self.acquire_size.0.store(0, Ordering::Relaxed);
+        self.acquire_size.0.store(0, Ordering::Release);
     }
 
 
@@ -132,14 +129,14 @@ impl<T> Buf<T> {
 
                 } else {
 
-                    self.used_size.fetch_add(reserve_size, Ordering::Relaxed);
-
                     unsafe {
 
                         std::ptr::copy(slice.as_ptr(), 
                                        self.ptr.offset(cur_acq_size as isize), 
                                        reserve_size);
                     }
+
+                    self.used_size.fetch_add(reserve_size, Ordering::Release);
 
                     let total_done = self.done_size.0.fetch_add(reserve_size, Ordering::Relaxed) + reserve_size;
                     return (true, total_done == self.size);
